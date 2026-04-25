@@ -84,3 +84,204 @@ bash examples/scripts/run_real.sh
 ## Credits
 This repository is built upon [jaxrl2](https://github.com/ikostrikov/jaxrl2) and [PTR](https://github.com/Asap7772/PTR) repositories. 
 In case of any questions, bugs, suggestions or improvements, please feel free to contact me at nakamoto\[at\]berkeley\[dot\]edu 
+
+
+# Running LIBERO on a CPU-only machine (no GPU)
+
+This documents the setup/debugging steps needed to run the LIBERO experiments in `dsrl_pi0` on a machine without a CUDA-capable GPU.
+
+---
+
+## 1. Create a clean Conda environment
+
+A broken / contaminated Conda environment caused issues initially (ROS packages leaking in, missing Python binary).
+
+Create a fresh env:
+
+```bash
+conda create -n dsrl python=3.11.11 -y
+conda activate dsrl
+```
+
+Verify:
+
+```bash
+which python
+which pip
+python -V
+python -m pip list
+```
+
+Expected:
+- Python from `~/miniconda3/envs/dsrl/...`
+- Pip from same env
+- only a few base packages installed
+
+---
+
+## 2. Install project dependencies
+
+From repo root:
+
+```bash
+cd ~/git/dsrl_pi0
+python -m pip install -e .
+# Dont forget to install JAX as cpu only
+pip install "jax[cpu]==0.5.0"
+```
+
+---
+
+## 3. Fix LIBERO import path
+
+LIBERO package structure requires adding the local `LIBERO/` directory to `PYTHONPATH`.
+
+From repo root:
+
+```bash
+export PYTHONPATH="$PWD/LIBERO:$PYTHONPATH"
+```
+
+Without this, imports like:
+
+```python
+from libero.libero import benchmark
+```
+
+fail.
+
+---
+
+## 4. Install LIBERO editable
+
+```bash
+cd ~/git/dsrl_pi0/LIBERO
+python -m pip install -e .
+cd ..
+```
+
+---
+
+## 5. CPU-only rendering setup (important)
+
+Default script assumed EGL / GPU rendering:
+
+```bash
+MUJOCO_GL=egl
+```
+
+This fails on machines without GPU support.
+
+### Use OSMesa instead
+
+```bash
+unset CUDA_VISIBLE_DEVICES
+unset MUJOCO_EGL_DEVICE_ID
+
+export MUJOCO_GL=osmesa
+export PYOPENGL_PLATFORM=osmesa
+```
+
+---
+
+## 6. Install OSMesa / Mesa dependencies
+
+Needed for CPU offscreen rendering:
+
+```bash
+sudo apt update
+sudo apt install \
+    libosmesa6 \
+    libosmesa6-dev \
+    libgl1-mesa-dev \
+    libglu1-mesa-dev
+```
+
+## 7. Required environment variables for launch
+
+From repo root:
+
+```bash
+export PYTHONPATH="$PWD/LIBERO:$PYTHONPATH"
+export MUJOCO_GL=osmesa
+export PYOPENGL_PLATFORM=osmesa
+
+unset CUDA_VISIBLE_DEVICES
+unset MUJOCO_EGL_DEVICE_ID
+
+export EXP=./logs/DSRL_pi0_Libero
+export OPENPI_DATA_HOME=./openpi
+
+mkdir -p "$EXP"
+```
+
+---
+
+## 8. Launch training manually
+
+```bash
+python -m examples.launch_train_sim \
+  --algorithm pixel_sac \
+  --env libero \
+  --prefix dsrl_pi0_libero \
+  --wandb_project DSRL_pi0_Libero \
+  --batch_size 256 \
+  --discount 0.999 \
+  --seed 0 \
+  --max_steps 500000 \
+  --eval_interval 10000 \
+  --log_interval 500 \
+  --eval_episodes 10 \
+  --multi_grad_step 20 \
+  --start_online_updates 500 \
+  --resize_image 64 \
+  --action_magnitude 1.0 \
+  --query_freq 20 \
+  --hidden_dims 128
+```
+
+---
+
+## 11. Recommended fixes for `examples/scripts/run_libero.sh`
+
+Update script to include:
+
+```bash
+export PYTHONPATH="$PWD/LIBERO:$PYTHONPATH"
+
+unset CUDA_VISIBLE_DEVICES
+unset MUJOCO_EGL_DEVICE_ID
+
+export MUJOCO_GL=osmesa
+export PYOPENGL_PLATFORM=osmesa
+
+export OPENPI_DATA_HOME=./openpi
+export EXP=./logs/$proj_name
+mkdir -p "$EXP"
+```
+
+Also prefer:
+
+```bash
+python -m examples.launch_train_sim ...
+```
+
+instead of:
+
+```bash
+python3 examples/launch_train_sim.py
+```
+
+---
+
+## 12. Remaining note: LIBERO datasets
+
+Warning observed:
+
+```bash
+[Warning]: datasets path ... does not exist!
+```
+
+This may require downloading LIBERO datasets separately depending on experiment.
+
+Check LIBERO documentation if dataset-related errors appear next.
