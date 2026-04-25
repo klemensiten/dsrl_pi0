@@ -16,9 +16,9 @@ import gymnasium as gym
 import gym_aloha
 from gym.spaces import Dict, Box
 
-from libero.libero import benchmark
-from libero.libero import get_libero_path
-from libero.libero.envs import OffScreenRenderEnv
+from libero.libero.libero import benchmark
+from libero.libero.libero import get_libero_path
+from libero.libero.libero.envs import OffScreenRenderEnv
 
 from jaxrl2.data import ReplayBuffer
 from jaxrl2.utils.wandb_logger import WandBLogger, create_exp_name
