@@ -1,18 +1,23 @@
-from audioop import cross
 from typing import Dict, Tuple
 
 import jax
 import jax.numpy as jnp
 from flax.training.train_state import TrainState
 
+from jaxrl2.agents.pixel_maxinfosac.ensemble_utils import ensemble_inputs
 from jaxrl2.data.dataset import DatasetDict
+from jaxrl2.networks.ensemble_model import DeterministicEnsemble, EnsembleState
 from jaxrl2.types import Params, PRNGKey
 
 
 def update_actor(key: PRNGKey, actor: TrainState, critic: TrainState,
-                 temp: TrainState, batch: DatasetDict, cross_norm:bool=False, critic_reduction:str='min') -> Tuple[TrainState, Dict[str, float]]:
+                 temp: TrainState, dyn_ent_temp: TrainState,
+                 ens: DeterministicEnsemble, ens_state: EnsembleState,
+                 target_actor_params: Params, batch: DatasetDict,
+                 model_obs_key: str, cross_norm: bool = False,
+                 critic_reduction: str = 'min') -> Tuple[TrainState, EnsembleState, Dict[str, float]]:
     
-    key, key_act = jax.random.split(key, num=2)
+    key, key_act, key_target = jax.random.split(key, num=3)
 
     def actor_loss_fn(
             actor_params: Params) -> Tuple[jnp.ndarray, Dict[str, float]]:
@@ -50,11 +55,39 @@ def update_actor(key: PRNGKey, actor: TrainState, critic: TrainState,
             q = qs.mean(axis=0)
         else:
             raise ValueError(f"Invalid critic reduction: {critic_reduction}")
-        actor_loss = (log_probs * temp.apply_fn({'params': temp.params}) - q).mean()
+
+        inp = ensemble_inputs(batch['observations'], actions, model_obs_key)
+        if hasattr(actor, 'batch_stats') and actor.batch_stats is not None:
+            target_dist = actor.apply_fn(
+                {'params': target_actor_params, 'batch_stats': actor.batch_stats},
+                batch['observations'])
+        else:
+            target_dist = actor.apply_fn(
+                {'params': target_actor_params}, batch['observations'])
+        target_actions = target_dist.sample(seed=key_target)
+        target_inp = ensemble_inputs(batch['observations'], target_actions,
+                                     model_obs_key)
+        total_inp = jnp.concatenate([inp, target_inp], axis=0)
+        info_gain, new_ens_state = ens.get_info_gain(
+            input=total_inp,
+            state=ens_state,
+            update_normalizer=True)
+        info_gain, target_info_gain = (
+            info_gain[:actions.shape[0]],
+            info_gain[actions.shape[0]:],
+        )
+
+        act_ent_coef = temp.apply_fn({'params': temp.params})
+        dyn_ent_coef = dyn_ent_temp.apply_fn({'params': dyn_ent_temp.params})
+        actor_loss = (act_ent_coef * log_probs - dyn_ent_coef * info_gain - q).mean()
 
         things_to_log = {
             'actor_loss': actor_loss,
             'entropy': -log_probs.mean(),
+            'info_gain': info_gain.mean(),
+            'target_info_gain': target_info_gain.mean(),
+            'dyn_ent_temperature': dyn_ent_coef,
+            'act_ent_temperature': act_ent_coef,
             'q_pi_in_actor': q.mean(),
             'mean_pi_norm': mean_dist_norm.mean(),
             'std_pi_norm': std_dist_norm.mean(),
@@ -65,13 +98,14 @@ def update_actor(key: PRNGKey, actor: TrainState, critic: TrainState,
             'std_pi_max': std_diag_dist.max(),
             'std_pi_min': std_diag_dist.min(),
         }
-        return actor_loss, (things_to_log, new_model_state)
+        return actor_loss, (new_ens_state, things_to_log, new_model_state)
 
-    grads, (info, new_model_state) = jax.grad(actor_loss_fn, has_aux=True)(actor.params)
+    grads, (new_ens_state, info, new_model_state) = jax.grad(
+        actor_loss_fn, has_aux=True)(actor.params)
     
     if 'batch_stats' in new_model_state:
         new_actor = actor.apply_gradients(grads=grads, batch_stats=new_model_state['batch_stats'])
     else:
         new_actor = actor.apply_gradients(grads=grads)
 
-    return new_actor, info
+    return new_actor, new_ens_state, info

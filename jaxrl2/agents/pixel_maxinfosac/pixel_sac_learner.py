@@ -24,12 +24,14 @@ from jaxrl2.networks.encoders.networks import Encoder, PixelMultiplexer
 from jaxrl2.networks.encoders.impala_encoder import ImpalaEncoder, SmallerImpalaEncoder
 from jaxrl2.networks.encoders.resnet_encoderv1 import ResNet18, ResNet34, ResNetSmall
 from jaxrl2.networks.encoders.resnet_encoderv2 import ResNetV2Encoder
-from jaxrl2.agents.pixel_sac.actor_updater import update_actor
-from jaxrl2.agents.pixel_sac.critic_updater import update_critic
-from jaxrl2.agents.pixel_sac.temperature_updater import update_temperature
-from jaxrl2.agents.pixel_sac.temperature import Temperature
+from jaxrl2.agents.pixel_maxinfosac.actor_updater import update_actor
+from jaxrl2.agents.pixel_maxinfosac.critic_updater import update_critic
+from jaxrl2.agents.pixel_maxinfosac.ensemble_utils import ensemble_inputs, ensemble_targets
+from jaxrl2.agents.pixel_maxinfosac.temperature_updater import update_temperature
+from jaxrl2.agents.pixel_maxinfosac.temperature import Temperature
 from jaxrl2.data.dataset import DatasetDict
 from jaxrl2.networks.learned_std_normal_policy import LearnedStdTanhNormalPolicy
+from jaxrl2.networks.ensemble_model import DeterministicEnsemble, EnsembleState
 from jaxrl2.networks.values import StateActionEnsemble
 from jaxrl2.types import Params, PRNGKey
 from jaxrl2.utils.target_update import soft_target_update
@@ -38,13 +40,30 @@ from jaxrl2.utils.target_update import soft_target_update
 class TrainState(train_state.TrainState):
     batch_stats: Any
 
-@functools.partial(jax.jit, static_argnames=('critic_reduction', 'color_jitter',  'aug_next', 'num_cameras'))
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        'critic_reduction',
+        'color_jitter',
+        'aug_next',
+        'num_cameras',
+        'backup_entropy',
+        'ens',
+        'model_obs_key',
+        'predict_reward',
+        'predict_diff',
+    ))
 def _update_jit(
     rng: PRNGKey, actor: TrainState, critic: TrainState,
-    target_critic_params: Params, temp: TrainState, batch: TrainState,
+    target_actor_params: Params, target_critic_params: Params,
+    temp: TrainState, dyn_ent_temp: TrainState,
+    ens: DeterministicEnsemble, ens_state: EnsembleState,
+    batch: DatasetDict,
     discount: float, tau: float, target_entropy: float,
     critic_reduction: str, color_jitter: bool, aug_next: bool, num_cameras: int,
-) -> Tuple[PRNGKey, TrainState, TrainState, Params, TrainState, Dict[str,float]]:
+    backup_entropy: bool, model_obs_key: str,
+    predict_reward: bool, predict_diff: bool,
+) -> Tuple[PRNGKey, TrainState, TrainState, Params, Params, TrainState, TrainState, EnsembleState, Dict[str,float]]:
     aug_pixels = batch['observations']['pixels']
     aug_next_pixels = batch['next_observations']['pixels']
     if batch['observations']['pixels'].squeeze().ndim != 2:
@@ -79,21 +98,60 @@ def _update_jit(
     
     key, rng = jax.random.split(rng)
     target_critic = critic.replace(params=target_critic_params)
-    new_critic, critic_info = update_critic(key, actor, critic, target_critic, temp, batch, discount, critic_reduction=critic_reduction)
+    new_critic, ens_state, critic_info = update_critic(
+        key, actor, critic, target_critic, temp, dyn_ent_temp, ens, ens_state, batch,
+        discount, backup_entropy=backup_entropy, model_obs_key=model_obs_key,
+        critic_reduction=critic_reduction)
     new_target_critic_params = soft_target_update(new_critic.params, target_critic_params, tau)
     
     key, rng = jax.random.split(rng)
-    new_actor, actor_info = update_actor(key, actor, new_critic, temp, batch, critic_reduction=critic_reduction)
+    new_actor, ens_state, actor_info = update_actor(
+        key, actor, new_critic, temp, dyn_ent_temp, ens, ens_state,
+        target_actor_params, batch, model_obs_key,
+        critic_reduction=critic_reduction)
+    new_target_actor_params = soft_target_update(
+        new_actor.params, target_actor_params, tau)
     new_temp, alpha_info = update_temperature(temp, actor_info['entropy'], target_entropy)
+    new_dyn_ent_temp, dyn_ent_info = update_temperature(
+        dyn_ent_temp, actor_info['info_gain'], actor_info['target_info_gain'])
+    dyn_ent_info = {
+        'dyn_ent_temperature' if key == 'temperature' else f'dyn_ent_{key}': value
+        for key, value in dyn_ent_info.items()
+    }
 
-    return rng, new_actor, new_critic, new_target_critic_params, new_temp, {
+    model_input = ensemble_inputs(batch['observations'], batch['actions'],
+                                  model_obs_key)
+    model_output = ensemble_targets(batch, model_obs_key, predict_reward,
+                                    predict_diff)
+    new_ens_state, (loss, mse) = ens.update(
+        input=model_input,
+        output=model_output,
+        state=ens_state,
+    )
+    normalizer_state = new_ens_state.ensemble_normalizer_state
+    dynamics_info = {
+        'ens_nll': loss,
+        'ens_mse': mse,
+        'dyn_model_loss': loss,
+        'dyn_model_mse': mse,
+        'ens_inp_mean': normalizer_state.input_normalizer_state.mean.mean(),
+        'ens_inp_std': normalizer_state.input_normalizer_state.std.mean(),
+        'ens_out_mean': normalizer_state.output_normalizer_state.mean.mean(),
+        'ens_out_std': normalizer_state.output_normalizer_state.std.mean(),
+        'ens_info_gain_mean': normalizer_state.info_gain_normalizer_state.mean.mean(),
+        'ens_info_gain_std': normalizer_state.info_gain_normalizer_state.std.mean(),
+    }
+
+    return rng, new_actor, new_critic, new_target_actor_params, new_target_critic_params, new_temp, new_dyn_ent_temp, new_ens_state, {
         **critic_info,
         **actor_info,
-        **alpha_info
+        **alpha_info,
+        **dyn_ent_info,
+        **dynamics_info,
     }
 
 
-class PixelSACLearner(Agent):
+class PixelMaxinfoSACLearner(Agent):
 
     def __init__(self,
                  seed: int,
@@ -120,6 +178,17 @@ class PixelSACLearner(Agent):
                  aug_next=True,
                  use_bottleneck=True,
                  init_temperature: float = 1.0,
+                 dyn_ent_lr: float = 3e-4,
+                 init_dyn_ent_temperature: float = 1.0,
+                 model_lr: float = 3e-4,
+                 model_wd: float = 0.0,
+                 model_hidden_dims: Sequence[int] = (256, 256),
+                 num_model_heads: int = 5,
+                 model_noise_var: float = 1.0,
+                 predict_reward: bool = True,
+                 predict_diff: bool = True,
+                 backup_entropy: bool = True,
+                 model_obs_key: str = "state",
                  num_qs: int = 2,
                  target_entropy: float = None,
                  action_magnitude: float = 1.0,
@@ -139,9 +208,20 @@ class PixelSACLearner(Agent):
         self.tau = tau
         self.discount = discount
         self.critic_reduction = critic_reduction
+        self.backup_entropy = backup_entropy
+        self.model_obs_key = model_obs_key
+        self.model_noise_var = model_noise_var
+        self.predict_reward = predict_reward
+        self.predict_diff = predict_diff
+
+        if model_obs_key not in observations:
+            raise ValueError(
+                f"PixelMaxInfoSAC requires observations['{model_obs_key}'] for "
+                "the dynamics ensemble. This prevents accidentally training "
+                "MaxInfo on raw pixels.")
 
         rng = jax.random.PRNGKey(seed)
-        rng, actor_key, critic_key, temp_key = jax.random.split(rng, 4)
+        rng, actor_key, critic_key, temp_key, dyn_ent_temp_key, ensemble_key = jax.random.split(rng, 6)
 
         if encoder_type == 'small':
             encoder_def = Encoder(cnn_features, cnn_strides, cnn_padding)
@@ -188,6 +268,7 @@ class PixelSACLearner(Agent):
                                   params=actor_params,
                                   tx=optax.adam(learning_rate=actor_lr),
                                   batch_stats=actor_batch_stats)
+        target_actor_params = copy.deepcopy(actor_params)
 
         critic_def = StateActionEnsemble(hidden_dims, num_qs=num_qs)
         critic_def = PixelMultiplexer(encoder=encoder_def,
@@ -215,12 +296,34 @@ class PixelSACLearner(Agent):
                                  tx=optax.adam(learning_rate=temp_lr),
                                  batch_stats=None)
 
+        dyn_ent_temp_def = Temperature(init_dyn_ent_temperature)
+        dyn_ent_temp_params = dyn_ent_temp_def.init(dyn_ent_temp_key)['params']
+        dyn_ent_temp = TrainState.create(
+            apply_fn=dyn_ent_temp_def.apply,
+            params=dyn_ent_temp_params,
+            tx=optax.adam(learning_rate=dyn_ent_lr),
+            batch_stats=None)
+
+        model_output_dim = int(np.prod(observations[model_obs_key].shape[1:]))
+        if predict_reward:
+            model_output_dim += 1
+        model_optimizer = optax.adamw(learning_rate=model_lr, weight_decay=model_wd)
+        ensemble = DeterministicEnsemble(
+            model_kwargs={'hidden_dims': tuple(model_hidden_dims) + (model_output_dim,)},
+            optimizer=model_optimizer,
+            num_heads=num_model_heads)
+        model_input = ensemble_inputs(observations, actions, model_obs_key)
+        ens_state = ensemble.init(key=ensemble_key, input=model_input)
 
         self._rng = rng
         self._actor = actor
         self._critic = critic
+        self._target_actor_params = target_actor_params
         self._target_critic_params = target_critic_params
         self._temp = temp
+        self._dyn_ent_temp = dyn_ent_temp
+        self._ensemble = ensemble
+        self._ens_state = ens_state
         if target_entropy is None or target_entropy == 'auto':
             self.target_entropy = -self.action_dim / 2
         else:
@@ -230,15 +333,25 @@ class PixelSACLearner(Agent):
         
 
     def update(self, batch: FrozenDict) -> Dict[str, float]:
-        new_rng, new_actor, new_critic, new_target_critic, new_temp, info = _update_jit(
-            self._rng, self._actor, self._critic, self._target_critic_params, self._temp, batch, self.discount, self.tau, self.target_entropy, self.critic_reduction, self.color_jitter, self.aug_next, self.num_cameras
+        new_rng, new_actor, new_critic, new_target_actor, new_target_critic, \
+            new_temp, new_dyn_ent_temp, new_ens_state, info = _update_jit(
+                self._rng, self._actor, self._critic,
+                self._target_actor_params, self._target_critic_params,
+                self._temp, self._dyn_ent_temp, self._ensemble, self._ens_state, batch,
+                self.discount, self.tau, self.target_entropy,
+                self.critic_reduction, self.color_jitter, self.aug_next,
+                self.num_cameras, self.backup_entropy, self.model_obs_key,
+                self.predict_reward, self.predict_diff
             )
 
         self._rng = new_rng
         self._actor = new_actor
         self._critic = new_critic
+        self._target_actor_params = new_target_actor
         self._target_critic_params = new_target_critic
         self._temp = new_temp
+        self._dyn_ent_temp = new_dyn_ent_temp
+        self._ens_state = new_ens_state
         return info
 
     def perform_eval(self, variant, i, wandb_logger, eval_buffer, eval_buffer_iterator, eval_env):
@@ -283,9 +396,12 @@ class PixelSACLearner(Agent):
     def _save_dict(self):
         save_dict = {
             'critic': self._critic,
+            'target_actor_params': self._target_actor_params,
             'target_critic_params': self._target_critic_params,
             'actor': self._actor,
-            'temp': self._temp
+            'temp': self._temp,
+            'dyn_ent_temp': self._dyn_ent_temp,
+            'ens_state': self._ens_state,
         }
         return save_dict
 
@@ -294,11 +410,17 @@ class PixelSACLearner(Agent):
         output_dict = checkpoints.restore_checkpoint(dir, self._save_dict)
         self._actor = output_dict['actor']
         self._critic = output_dict['critic']
+        self._target_actor_params = output_dict['target_actor_params']
         self._target_critic_params = output_dict['target_critic_params']
         self._temp = output_dict['temp']
+        self._dyn_ent_temp = output_dict['dyn_ent_temp']
+        self._ens_state = output_dict['ens_state']
         print('restored from ', dir)
         
-    
+
+PixelSACLearner = PixelMaxinfoSACLearner
+
+
 @functools.partial(jax.jit)
 def get_value(action, observation, critic):
     input_collections = {'params': critic.params}
