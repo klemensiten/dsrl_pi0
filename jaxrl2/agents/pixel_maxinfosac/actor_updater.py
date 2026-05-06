@@ -14,7 +14,7 @@ def update_actor(key: PRNGKey, actor: TrainState, critic: TrainState,
                  temp: TrainState, dyn_ent_temp: TrainState,
                  ens: DeterministicEnsemble, ens_state: EnsembleState,
                  target_actor_params: Params, batch: DatasetDict,
-                 model_obs_key: str, cross_norm: bool = False,
+                 cross_norm: bool = False,
                  critic_reduction: str = 'min') -> Tuple[TrainState, EnsembleState, Dict[str, float]]:
     
     key, key_act, key_target = jax.random.split(key, num=3)
@@ -44,19 +44,24 @@ def update_actor(key: PRNGKey, actor: TrainState, critic: TrainState,
         actions, log_probs = dist.sample_and_log_prob(seed=key_act)
 
         if hasattr(critic, 'batch_stats') and critic.batch_stats is not None:
-            qs, _ = critic.apply_fn({'params': critic.params, 'batch_stats': critic.batch_stats}, batch['observations'],
-                            actions, mutable=['batch_stats'])
-        else:    
-            qs = critic.apply_fn({'params': critic.params}, batch['observations'], actions)
+            qs, expl_qs, state, _ = critic.apply_fn(
+                {'params': critic.params, 'batch_stats': critic.batch_stats},
+                batch['observations'],
+                actions)
+        else:
+            qs, expl_qs, state, _ = critic.apply_fn(
+                {'params': critic.params}, batch['observations'], actions)
         
         if critic_reduction == 'min':
             q = qs.min(axis=0)
+            q_expl = expl_qs.min(axis=0)
         elif critic_reduction == 'mean':
             q = qs.mean(axis=0)
+            q_expl = expl_qs.mean(axis=0)
         else:
             raise ValueError(f"Invalid critic reduction: {critic_reduction}")
 
-        inp = ensemble_inputs(batch['observations'], actions, model_obs_key)
+        inp = ensemble_inputs(state, actions)
         if hasattr(actor, 'batch_stats') and actor.batch_stats is not None:
             target_dist = actor.apply_fn(
                 {'params': target_actor_params, 'batch_stats': actor.batch_stats},
@@ -65,8 +70,7 @@ def update_actor(key: PRNGKey, actor: TrainState, critic: TrainState,
             target_dist = actor.apply_fn(
                 {'params': target_actor_params}, batch['observations'])
         target_actions = target_dist.sample(seed=key_target)
-        target_inp = ensemble_inputs(batch['observations'], target_actions,
-                                     model_obs_key)
+        target_inp = ensemble_inputs(state, target_actions)
         total_inp = jnp.concatenate([inp, target_inp], axis=0)
         info_gain, new_ens_state = ens.get_info_gain(
             input=total_inp,
@@ -79,7 +83,8 @@ def update_actor(key: PRNGKey, actor: TrainState, critic: TrainState,
 
         act_ent_coef = temp.apply_fn({'params': temp.params})
         dyn_ent_coef = dyn_ent_temp.apply_fn({'params': dyn_ent_temp.params})
-        actor_loss = (act_ent_coef * log_probs - dyn_ent_coef * info_gain - q).mean()
+        actor_loss = (act_ent_coef * log_probs - q -
+                      dyn_ent_coef * q_expl).mean()
 
         things_to_log = {
             'actor_loss': actor_loss,
@@ -89,6 +94,7 @@ def update_actor(key: PRNGKey, actor: TrainState, critic: TrainState,
             'dyn_ent_temperature': dyn_ent_coef,
             'act_ent_temperature': act_ent_coef,
             'q_pi_in_actor': q.mean(),
+            'q_expl_pi_in_actor': q_expl.mean(),
             'mean_pi_norm': mean_dist_norm.mean(),
             'std_pi_norm': std_dist_norm.mean(),
             'mean_pi_avg': mean_dist.mean(),

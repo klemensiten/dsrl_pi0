@@ -26,13 +26,19 @@ from jaxrl2.networks.encoders.resnet_encoderv1 import ResNet18, ResNet34, ResNet
 from jaxrl2.networks.encoders.resnet_encoderv2 import ResNetV2Encoder
 from jaxrl2.agents.pixel_maxinfosac.actor_updater import update_actor
 from jaxrl2.agents.pixel_maxinfosac.critic_updater import update_critic
-from jaxrl2.agents.pixel_maxinfosac.ensemble_utils import ensemble_inputs, ensemble_targets
+from jaxrl2.agents.pixel_maxinfosac.ensemble_utils import (
+    available_modalities,
+    disagreement_weights,
+    ensemble_inputs,
+    ensemble_targets_from_modalities,
+    modality_output_slices,
+)
+from jaxrl2.agents.pixel_maxinfosac.networks import PixelMaxInfoCritic
 from jaxrl2.agents.pixel_maxinfosac.temperature_updater import update_temperature
 from jaxrl2.agents.pixel_maxinfosac.temperature import Temperature
 from jaxrl2.data.dataset import DatasetDict
 from jaxrl2.networks.learned_std_normal_policy import LearnedStdTanhNormalPolicy
 from jaxrl2.networks.ensemble_model import DeterministicEnsemble, EnsembleState
-from jaxrl2.networks.values import StateActionEnsemble
 from jaxrl2.types import Params, PRNGKey
 from jaxrl2.utils.target_update import soft_target_update
 
@@ -52,6 +58,8 @@ class TrainState(train_state.TrainState):
         'model_obs_key',
         'predict_reward',
         'predict_diff',
+        'ensemble_output_modalities',
+        'mask_expl_critic',
     ))
 def _update_jit(
     rng: PRNGKey, actor: TrainState, critic: TrainState,
@@ -63,6 +71,8 @@ def _update_jit(
     critic_reduction: str, color_jitter: bool, aug_next: bool, num_cameras: int,
     backup_entropy: bool, model_obs_key: str,
     predict_reward: bool, predict_diff: bool,
+    ensemble_output_modalities: Tuple[str, ...],
+    mask_expl_critic: bool,
 ) -> Tuple[PRNGKey, TrainState, TrainState, Params, Params, TrainState, TrainState, EnsembleState, Dict[str,float]]:
     aug_pixels = batch['observations']['pixels']
     aug_next_pixels = batch['next_observations']['pixels']
@@ -100,14 +110,24 @@ def _update_jit(
     target_critic = critic.replace(params=target_critic_params)
     new_critic, ens_state, critic_info = update_critic(
         key, actor, critic, target_critic, temp, dyn_ent_temp, ens, ens_state, batch,
-        discount, backup_entropy=backup_entropy, model_obs_key=model_obs_key,
+        discount, backup_entropy=backup_entropy,
+        mask_expl_critic=mask_expl_critic,
         critic_reduction=critic_reduction)
     new_target_critic_params = soft_target_update(new_critic.params, target_critic_params, tau)
+
+    model_state = critic_info['state']
+    model_modalities = critic_info['modalities']
+    model_next_modalities = critic_info['next_modalities']
+    critic_info = {
+        key: value
+        for key, value in critic_info.items()
+        if key not in ('state', 'next_state', 'modalities', 'next_modalities')
+    }
     
     key, rng = jax.random.split(rng)
     new_actor, ens_state, actor_info = update_actor(
         key, actor, new_critic, temp, dyn_ent_temp, ens, ens_state,
-        target_actor_params, batch, model_obs_key,
+        target_actor_params, batch,
         critic_reduction=critic_reduction)
     new_target_actor_params = soft_target_update(
         new_actor.params, target_actor_params, tau)
@@ -119,10 +139,15 @@ def _update_jit(
         for key, value in dyn_ent_info.items()
     }
 
-    model_input = ensemble_inputs(batch['observations'], batch['actions'],
-                                  model_obs_key)
-    model_output = ensemble_targets(batch, model_obs_key, predict_reward,
-                                    predict_diff)
+    model_input = ensemble_inputs(model_state, batch['actions'])
+    model_output = ensemble_targets_from_modalities(
+        model_modalities,
+        model_next_modalities,
+        batch['rewards'],
+        predict_reward,
+        predict_diff,
+        ensemble_output_modalities,
+    )
     new_ens_state, (loss, mse) = ens.update(
         input=model_input,
         output=model_output,
@@ -189,6 +214,11 @@ class PixelMaxinfoSACLearner(Agent):
                  predict_diff: bool = True,
                  backup_entropy: bool = True,
                  model_obs_key: str = "state",
+                 obs_dim: int = 64,
+                 ensemble_disagreement_modalities: Optional[Sequence[str]] = None,
+                 mask_expl_critic: bool = False,
+                 tactile_hidden_dims: Sequence[int] = (256, 256),
+                 mask_touch: bool = False,
                  num_qs: int = 2,
                  target_entropy: float = None,
                  action_magnitude: float = 1.0,
@@ -213,12 +243,7 @@ class PixelMaxinfoSACLearner(Agent):
         self.model_noise_var = model_noise_var
         self.predict_reward = predict_reward
         self.predict_diff = predict_diff
-
-        if model_obs_key not in observations:
-            raise ValueError(
-                f"PixelMaxInfoSAC requires observations['{model_obs_key}'] for "
-                "the dynamics ensemble. This prevents accidentally training "
-                "MaxInfo on raw pixels.")
+        self.mask_expl_critic = mask_expl_critic
 
         rng = jax.random.PRNGKey(seed)
         rng, actor_key, critic_key, temp_key, dyn_ent_temp_key, ensemble_key = jax.random.split(rng, 6)
@@ -270,12 +295,19 @@ class PixelMaxinfoSACLearner(Agent):
                                   batch_stats=actor_batch_stats)
         target_actor_params = copy.deepcopy(actor_params)
 
-        critic_def = StateActionEnsemble(hidden_dims, num_qs=num_qs)
-        critic_def = PixelMultiplexer(encoder=encoder_def,
-                                      network=critic_def,
-                                      latent_dim=latent_dim,
-                                      use_bottleneck=use_bottleneck
-                                      )
+        critic_def = PixelMaxInfoCritic(
+            encoder=encoder_def,
+            hidden_dims=hidden_dims,
+            latent_dim=latent_dim,
+            obs_dim=obs_dim,
+            num_qs=num_qs,
+            model_obs_key=model_obs_key,
+            use_bottleneck=use_bottleneck,
+            tactile_hidden_dims=tactile_hidden_dims,
+            tactile_cnn_features=cnn_features,
+            tactile_cnn_strides=cnn_strides,
+            tactile_cnn_padding=cnn_padding,
+            mask_touch=mask_touch)
         print(critic_def)
         critic_def_init = critic_def.init(critic_key, observations, actions)
         self._critic_init_params = critic_def_init['params']
@@ -288,6 +320,21 @@ class PixelMaxinfoSACLearner(Agent):
                                    batch_stats=critic_batch_stats
                                    )
         target_critic_params = copy.deepcopy(critic_params)
+
+        # TODO: Debug block
+        critic_vars = {'params': critic_params}
+        if critic_batch_stats is not None:
+            critic_vars['batch_stats'] = critic_batch_stats
+        _, _, sample_state, sample_modalities = critic_def.apply(
+            critic_vars, observations, actions)
+        ensemble_output_modalities = available_modalities(sample_modalities)
+        if not ensemble_output_modalities:
+            raise ValueError(
+                'PixelMaxInfoSAC could not build any ensemble output modalities from the critic.')
+        output_slices = modality_output_slices(
+            sample_modalities,
+            ensemble_output_modalities,
+            predict_reward=predict_reward)
         
         temp_def = Temperature(init_temperature)
         temp_params = temp_def.init(temp_key)['params']
@@ -304,16 +351,17 @@ class PixelMaxinfoSACLearner(Agent):
             tx=optax.adam(learning_rate=dyn_ent_lr),
             batch_stats=None)
 
-        model_output_dim = int(np.prod(observations[model_obs_key].shape[1:]))
-        if predict_reward:
-            model_output_dim += 1
+        model_output_dim = max(end for _, end in output_slices.values())
         model_optimizer = optax.adamw(learning_rate=model_lr, weight_decay=model_wd)
         ensemble = DeterministicEnsemble(
             model_kwargs={'hidden_dims': tuple(model_hidden_dims) + (model_output_dim,)},
             optimizer=model_optimizer,
             num_heads=num_model_heads)
-        model_input = ensemble_inputs(observations, actions, model_obs_key)
+        model_input = ensemble_inputs(sample_state, actions)
         ens_state = ensemble.init(key=ensemble_key, input=model_input)
+        ensemble.set_disg_weights(
+            disagreement_weights(output_slices,
+                                 ensemble_disagreement_modalities))
 
         self._rng = rng
         self._actor = actor
@@ -324,6 +372,11 @@ class PixelMaxinfoSACLearner(Agent):
         self._dyn_ent_temp = dyn_ent_temp
         self._ensemble = ensemble
         self._ens_state = ens_state
+        self._ensemble_output_modalities = ensemble_output_modalities
+        self._ensemble_output_slices = output_slices
+        self._ensemble_disagreement_modalities = (
+            None if ensemble_disagreement_modalities is None
+            else tuple(ensemble_disagreement_modalities))
         if target_entropy is None or target_entropy == 'auto':
             self.target_entropy = -self.action_dim / 2
         else:
@@ -341,7 +394,8 @@ class PixelMaxinfoSACLearner(Agent):
                 self.discount, self.tau, self.target_entropy,
                 self.critic_reduction, self.color_jitter, self.aug_next,
                 self.num_cameras, self.backup_entropy, self.model_obs_key,
-                self.predict_reward, self.predict_diff
+                self.predict_reward, self.predict_diff,
+                self._ensemble_output_modalities, self.mask_expl_critic
             )
 
         self._rng = new_rng
@@ -418,13 +472,13 @@ class PixelMaxinfoSACLearner(Agent):
         print('restored from ', dir)
         
 
-PixelSACLearner = PixelMaxinfoSACLearner
-
 
 @functools.partial(jax.jit)
 def get_value(action, observation, critic):
     input_collections = {'params': critic.params}
-    q_pred = critic.apply_fn(input_collections, observation, action)
+    if getattr(critic, 'batch_stats', None) is not None:
+        input_collections['batch_stats'] = critic.batch_stats
+    q_pred, _, _, _ = critic.apply_fn(input_collections, observation, action)
     return q_pred
 
 
