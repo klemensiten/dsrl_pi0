@@ -13,6 +13,23 @@ def _flatten(x: jnp.ndarray) -> jnp.ndarray:
     return jnp.reshape(x, (x.shape[0], -1))
 
 
+def _max_pool_to_dim(x: jnp.ndarray, output_dim: int) -> jnp.ndarray:
+    x = _flatten(x)
+    feature_dim = x.shape[-1]
+    if feature_dim == output_dim:
+        return x
+    if feature_dim < output_dim:
+        return jnp.pad(x, ((0, 0), (0, output_dim - feature_dim)))
+
+    pool_size = (feature_dim + output_dim - 1) // output_dim
+    padded_dim = pool_size * output_dim
+    pad = padded_dim - feature_dim
+    if pad:
+        x = jnp.pad(x, ((0, 0), (0, pad)), constant_values=-jnp.inf)
+    x = jnp.reshape(x, (x.shape[0], output_dim, pool_size))
+    return jnp.max(x, axis=-1)
+
+
 def _touch_mask(x: jnp.ndarray) -> jnp.ndarray:
     axes = tuple(range(1, x.ndim))
     return (jnp.max(jnp.abs(x), axis=axes) > 0)[..., jnp.newaxis]
@@ -77,7 +94,7 @@ class PixelMaxInfoCritic(nn.Module):
         image_features = self.encoder(observations['pixels'], training)
 
         # compute image latent same as in PixelMultiplexer for the critic
-        # TODO: also add tactile modalities?
+        # TODO: also add tactile modalities
         if self.use_bottleneck:
             latent = nn.Dense(
                 self.latent_dim, kernel_init=xavier_init(), name='latent')(
@@ -87,26 +104,18 @@ class PixelMaxInfoCritic(nn.Module):
         else:
             latent = image_features
 
-        # compact image target for the ensemble
-        # TODO: this was max pooling for MaxinfoDrQ. Change?
-        image_embed = nn.Dense(
-            self.obs_dim, kernel_init=xavier_init(), name='image_embed')(
-                image_features)
-        image_embed = nn.LayerNorm(name='image_embed_ln')(image_embed)
-        image_embed = nn.tanh(image_embed)
+        # Deterministic ensemble target, matching MaxInfoDrQ no-parameter pooling
+        image_embed = _max_pool_to_dim(image_features, self.obs_dim)
 
         modalities = {
             'latent': latent,
             'image': image_embed,
         }
         if self.model_obs_key in observations:
-            state_embed = nn.Dense(
-                self.obs_dim, kernel_init=xavier_init(), name='state_embed')(
-                    _flatten(observations[self.model_obs_key]))
-            state_embed = nn.LayerNorm(name='state_embed_ln')(state_embed)
-            modalities['state'] = nn.tanh(state_embed)
+            modalities['state'] = _flatten(observations[self.model_obs_key])
         if 'tactile' in observations:
             # currently a placeholder
+            # TODO: change to max pooling too
             modalities['tactile'] = self._encode_tactile(
                 observations['tactile'], training=training)
 
