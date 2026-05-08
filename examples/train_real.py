@@ -1,6 +1,8 @@
 #! /usr/bin/env python
+import inspect
 import os
 import jax
+from jaxrl2.agents.pixel_maxinfosac.pixel_maxinfosac_learner import PixelMaxinfoSACLearner
 from jaxrl2.agents.pixel_sac.pixel_sac_learner import PixelSACLearner
 from jaxrl2.utils.general_utils import add_batch_dim
 import numpy as np
@@ -21,6 +23,57 @@ from droid.robot_env import RobotEnv
 
 home_dir = os.environ['HOME']
 compilation_cache.initialize_cache(os.path.join(home_dir, 'jax_compilation_cache'))
+
+
+LEARNER_BY_ALGORITHM = {
+    'pixel_sac': PixelSACLearner,
+    'pixel_maxinfosac': PixelMaxinfoSACLearner,
+}
+
+
+def _normalize_ensemble_disagreement_modalities(kwargs):
+    modalities = kwargs.get('ensemble_disagreement_modalities')
+    if not isinstance(modalities, str):
+        return
+
+    modalities = modalities.strip()
+    if not modalities:
+        kwargs['ensemble_disagreement_modalities'] = None
+        return
+
+    kwargs['ensemble_disagreement_modalities'] = tuple(
+        modality.strip()
+        for modality in modalities.split(',')
+        if modality.strip())
+
+
+def _make_agent(variant, sample_obs, sample_action):
+    algorithm = str(variant.algorithm).strip().lower()
+    if algorithm not in LEARNER_BY_ALGORITHM:
+        supported = ', '.join(sorted(LEARNER_BY_ALGORITHM))
+        raise ValueError(
+            f"Unsupported algorithm '{variant.algorithm}'. "
+            f"Supported algorithms: {supported}.")
+
+    learner_cls = LEARNER_BY_ALGORITHM[algorithm]
+    kwargs = dict(variant['train_kwargs'])
+    _normalize_ensemble_disagreement_modalities(kwargs)
+
+    valid_kwargs = set(inspect.signature(learner_cls.__init__).parameters)
+    valid_kwargs.discard('self')
+    learner_kwargs = {
+        key: value
+        for key, value in kwargs.items()
+        if key in valid_kwargs
+    }
+    dropped_kwargs = sorted(set(kwargs) - set(learner_kwargs))
+    if dropped_kwargs:
+        print(f"Dropping unsupported {algorithm} train kwargs: {dropped_kwargs}")
+
+    print(f"Using algorithm: {algorithm}")
+    return learner_cls(variant.seed, sample_obs, sample_action,
+                       **learner_kwargs)
+
 
 def shard_batch(batch, sharding):
     """Shards a batch across devices along its first dimension.
@@ -115,7 +168,7 @@ def main(variant):
     logging.info('sample obs shapes', [(k, v.shape) for k, v in sample_obs.items()])
     logging.info('sample action shape', sample_action.shape)
     
-    agent = PixelSACLearner(variant.seed, sample_obs, sample_action, **kwargs)
+    agent = _make_agent(variant, sample_obs, sample_action)
     
     if variant.restore_path != '':
         logging.info('restoring from', variant.restore_path)

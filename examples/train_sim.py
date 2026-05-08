@@ -5,9 +5,11 @@ xla_flags = os.environ.get('XLA_FLAGS', '')
 xla_flags += ' --xla_gpu_triton_gemm_any=True'
 os.environ['XLA_FLAGS'] = xla_flags
 
+import inspect
 import pathlib, copy
 
 import jax
+from jaxrl2.agents.pixel_maxinfosac.pixel_maxinfosac_learner import PixelMaxinfoSACLearner
 from jaxrl2.agents.pixel_sac.pixel_sac_learner import PixelSACLearner
 from jaxrl2.utils.general_utils import add_batch_dim
 import numpy as np
@@ -16,9 +18,9 @@ import gymnasium as gym
 import gym_aloha
 from gym.spaces import Dict, Box
 
-from libero.libero import benchmark
-from libero.libero import get_libero_path
-from libero.libero.envs import OffScreenRenderEnv
+from libero.libero.libero import benchmark
+from libero.libero.libero import get_libero_path
+from libero.libero.libero.envs import OffScreenRenderEnv
 
 from jaxrl2.data import ReplayBuffer
 from jaxrl2.utils.wandb_logger import WandBLogger, create_exp_name
@@ -34,6 +36,57 @@ from openpi.shared import download
 
 home_dir = os.environ['HOME']
 compilation_cache.initialize_cache(os.path.join(home_dir, 'jax_compilation_cache'))
+
+
+LEARNER_BY_ALGORITHM = {
+    'pixel_sac': PixelSACLearner,
+    'pixel_maxinfosac': PixelMaxinfoSACLearner,
+}
+
+
+def _normalize_ensemble_disagreement_modalities(kwargs):
+    modalities = kwargs.get('ensemble_disagreement_modalities')
+    if not isinstance(modalities, str):
+        return
+
+    modalities = modalities.strip()
+    if not modalities:
+        kwargs['ensemble_disagreement_modalities'] = None
+        return
+
+    kwargs['ensemble_disagreement_modalities'] = tuple(
+        modality.strip()
+        for modality in modalities.split(',')
+        if modality.strip())
+
+
+def _make_agent(variant, sample_obs, sample_action):
+    algorithm = str(variant.algorithm).strip().lower()
+    if algorithm not in LEARNER_BY_ALGORITHM:
+        supported = ', '.join(sorted(LEARNER_BY_ALGORITHM))
+        raise ValueError(
+            f"Unsupported algorithm '{variant.algorithm}'. "
+            f"Supported algorithms: {supported}.")
+
+    learner_cls = LEARNER_BY_ALGORITHM[algorithm]
+    kwargs = dict(variant['train_kwargs'])
+    _normalize_ensemble_disagreement_modalities(kwargs)
+
+    valid_kwargs = set(inspect.signature(learner_cls.__init__).parameters)
+    valid_kwargs.discard('self')
+    learner_kwargs = {
+        key: value
+        for key, value in kwargs.items()
+        if key in valid_kwargs
+    }
+    dropped_kwargs = sorted(set(kwargs) - set(learner_kwargs))
+    if dropped_kwargs:
+        print(f"Dropping unsupported {algorithm} train kwargs: {dropped_kwargs}")
+
+    print(f"Using algorithm: {algorithm}")
+    return learner_cls(variant.seed, sample_obs, sample_action,
+                       **learner_kwargs)
+
 
 def _get_libero_env(task, resolution, seed):
     """Initializes and returns the LIBERO environment, along with the task description."""
@@ -154,7 +207,7 @@ def main(variant):
         raise NotImplementedError()
     agent_dp = policy_config.create_trained_policy(config, checkpoint_dir)
     print("Loaded pi0 policy from %s", checkpoint_dir)
-    agent = PixelSACLearner(variant.seed, sample_obs, sample_action, **kwargs)
+    agent = _make_agent(variant, sample_obs, sample_action)
 
     online_buffer_size = variant.max_steps  // variant.multi_grad_step
     online_replay_buffer = ReplayBuffer(dummy_env.observation_space, dummy_env.action_space, int(online_buffer_size))

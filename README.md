@@ -35,7 +35,7 @@ conda activate dsrl_pi0
 
 2. Clone this repo with all submodules
 ```
-git clone git@github.com:nakamotoo/dsrl_pi0.git --recurse-submodules
+git clone git@github.com:klemensiten/dsrl_pi0.git --recurse-submodules
 cd dsrl_pi0
 ```
 
@@ -52,6 +52,11 @@ pip install -e openpi/packages/openpi-client
 # install Libero
 pip install -e LIBERO
 pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu # needed for libero
+
+# If LIBERO imports fail because of package nesting, use the local workaround:
+mv LIBERO libero
+find . \( -name '*.py' -o -name '*.sh' -o -name '*.yaml' -o -name '*.yml' -o -name '*.txt' \) -type f \
+  -exec perl -pi -e 's/libero\.libero(?!\.libero)/libero.libero.libero/g' {} +
 ```
 
 ## Training (Simulation)
