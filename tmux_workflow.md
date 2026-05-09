@@ -13,7 +13,7 @@ Inside the session, activate the environment and start the run:
 ```bash
 cd /local/kiten/dsrl_pi0
 conda activate dsrl_pi0
-python examples/train_sim.py
+bash examples/scripts/run_libero.sh
 ```
 
 ## Detach without stopping the job
