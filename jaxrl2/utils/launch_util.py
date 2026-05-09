@@ -6,6 +6,7 @@ import itertools
 import json
 import multiprocessing
 import os
+import shlex
 import sys
 from typing import Dict, Optional, Any, List
 
@@ -116,35 +117,47 @@ def parse_training_args(train_args_dict, parser):
     return variant, args
 
 
-def generate_base_command(module, flags: Optional[Dict[str, Any]] = None, unbuffered: bool = True) -> str:
-    """ Generates the command to execute python module with provided flags
-
-    Args:
-        module: python module / file to run
-        flags: dictionary of flag names and the values to assign to them.
-               assumes that boolean flags are encoded as store_true flags with False as default.
-        unbuffered: whether to invoke an unbuffered python output stream
-
-    Returns: (str) command which can be executed via bash
-
+def generate_base_command(module_name: str,
+                          flags: Optional[Dict[str, Any]] = None,
+                          env: Optional[Dict[str, Any]] = None,
+                          pre_commands: Optional[List[str]] = None,
+                          unbuffered: bool = True) -> str:
+    """Generate a shell command for a python module launch.
     """
-
-    """ Module is a python file to execute """
-    interpreter_script = sys.executable
-    base_exp_script = os.path.abspath(module.__file__)
+    cmd_parts = ['python']
     if unbuffered:
-        base_cmd = interpreter_script + ' -u ' + base_exp_script
-    else:
-        base_cmd = interpreter_script + ' ' + base_exp_script
+        cmd_parts.append('-u')
+    cmd_parts.extend(['-m', module_name])
+
     if flags is not None:
         assert isinstance(flags, dict), "Flags must be provided as dict"
         for flag, setting in flags.items():
-            if type(setting) == bool or type(setting) == np.bool_:
-                if setting:
-                    base_cmd += f" --{flag}"
+            if setting is None:
+                continue
+            if isinstance(setting, (list, tuple)):
+                cmd_parts.append(f'--{flag}')
+                cmd_parts.extend(shlex.quote(str(_normalize_flag_value(value)))
+                                 for value in setting)
             else:
-                base_cmd += f" --{flag}={setting}"
-    return base_cmd
+                cmd_parts.append(f'--{flag}')
+                cmd_parts.append(shlex.quote(str(_normalize_flag_value(setting))))
+
+    command = ' '.join(cmd_parts)
+    if env:
+        env_assignments = [
+            f'{key}={shlex.quote(str(value))}'
+            for key, value in env.items()
+        ]
+        command = ' '.join(env_assignments + [command])
+    if pre_commands:
+        command = ' && '.join(list(pre_commands) + [command])
+    return command
+
+
+def _normalize_flag_value(value: Any) -> Any:
+    if isinstance(value, (bool, np.bool_)):
+        return int(value)
+    return value
 
 
 def generate_run_commands(command_list: List[str], output_file_list: Optional[List[str]] = None,
@@ -184,7 +197,7 @@ def generate_run_commands(command_list: List[str], output_file_list: Optional[Li
                                f"cores each. proceed? [yes/no]")
             else:
                 answer = 'yes'
-            if answer == 'yes':
+            if answer in ['yes','y','Y']:
                 for cmd in cluster_cmds:
                     os.system(cmd)
 
