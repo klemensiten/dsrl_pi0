@@ -8,11 +8,12 @@ from jaxrl2.utils.launch_util import (
     dict_permutations,
     generate_base_command,
     generate_run_commands,
+    hash_dict,
 )
 
 
 ENTITY = 'kiten'
-PROJECT_NAME = 'DSRL_pi0_Libero'
+PROJECT_NAME = 'DSRL_pi0_Libero_March_11_10_00  '  # Make sure to change this for your sweep!           
 MODULE_NAME = 'examples.launch_train_sim'
 
 
@@ -56,16 +57,16 @@ BASE_FLAGS = {
 # Edit this block to choose the sweep. Values are combined as a Cartesian product.
 # For example, uncommenting dyn_ent_lr below launches every seed x dyn_ent_lr pair.
 SWEEP_FLAGS = {
-    'seed': [0, 1, 2],
-    # 'dyn_ent_lr': [0.0001, 0.0003, 0.0],
-    # 'init_dyn_ent_temperature': [0.1, 1.0, 0.00000001],
-    # 'model_lr': [0.001, 0.0003, 0.0],
-    # 'model_wd': [0.0001, 0.0],
+    'seed': [0, 1, 2, 3, 4],
+    'dyn_ent_lr': [0.0001, 0.0003, 0.0],
+    'init_dyn_ent_temperature': [0.1, 1.0, 0.00000001],
+    'model_lr': [0.001, 0.0003, 0.0],
+    'model_wd': [0.0001, 0.0],
     # 'model_hidden_dims': [[512, 512], [256, 256]],
     # 'num_model_heads': [7, 5, 1],
     # 'predict_reward': [1, 0],
     # 'backup_entropy': [1, 0],
-    # 'ensemble_disagreement_modalities': ['latent,state', ''],
+    'ensemble_disagreement_modalities': ['image'],
     # 'mask_expl_critic': [1, 0],
 }
 
@@ -76,25 +77,8 @@ def build_flags(project_name):
         flags = copy.deepcopy(BASE_FLAGS)
         flags['wandb_project'] = project_name
         flags.update(sweep_flags)
-        flags.setdefault('suffix', make_suffix(flags, sweep_keys))
+        flags.setdefault('suffix', hash_dict(sweep_flags))
         yield flags
-
-
-def make_suffix(flags, sweep_keys):
-    suffix_parts = []
-    for key in sweep_keys:
-        if key == 'seed':
-            continue
-        suffix_parts.append(f'{key}_{format_value(flags[key])}')
-    if not suffix_parts:
-        return '_'
-    return slug('_'.join(suffix_parts))
-
-
-def format_value(value):
-    if isinstance(value, (list, tuple)):
-        return 'x'.join(format_value(item) for item in value)
-    return str(value)
 
 
 def slug(value):
@@ -116,7 +100,7 @@ def parse_args():
     parser.add_argument('--exp_dir', type=str, default=None)
     parser.add_argument('--num_cpus', type=int, default=1)
     parser.add_argument('--num_gpus', type=int, default=1)
-    parser.add_argument('--gpu_type', type=str, default=None)
+    parser.add_argument('--gpu_type', type=str, default='rtx_3090')
     parser.add_argument('--mem', type=int, default=32000)
     parser.add_argument('--duration', type=str, default=None)
     parser.add_argument('--mode', type=str, default='euler',
