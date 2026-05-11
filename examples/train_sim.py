@@ -163,12 +163,19 @@ def main(variant):
     
     if variant.env == 'libero':
         benchmark_dict = benchmark.get_benchmark_dict()
-        task_suite = benchmark_dict["libero_90"]()
-        task_id = 57
-        task = task_suite.get_task(task_id)
+        if variant.libero_suite not in benchmark_dict:
+            supported_suites = ', '.join(sorted(benchmark_dict))
+            raise ValueError(
+                f"Unsupported LIBERO suite '{variant.libero_suite}'. "
+                f"Supported suites: {supported_suites}.")
+        task_suite = benchmark_dict[variant.libero_suite]()
+        task = task_suite.get_task(variant.libero_task_id)
         env, task_description = _get_libero_env(task, 256, variant.seed)
         eval_env = env
         variant.task_description = task_description
+        print(
+            f"Using LIBERO task: suite={variant.libero_suite}, "
+            f"task_id={variant.libero_task_id}, description={task_description}")
         variant.env_max_reward = 1
         variant.max_timesteps = 400
     elif variant.env == 'aloha_cube':
