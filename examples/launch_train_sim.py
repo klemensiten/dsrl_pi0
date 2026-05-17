@@ -67,6 +67,7 @@ if __name__ == '__main__':
         num_qs=10,
         action_magnitude=1.0,
         num_cameras=1,
+        explore_until=300000,
         )
 
     variant, args = parse_training_args(train_args_dict, parser)
