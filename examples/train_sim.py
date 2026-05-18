@@ -10,7 +10,7 @@ import pathlib, copy
 
 import jax
 from jaxrl2.agents.pixel_maxinfosac.pixel_maxinfosac_learner import PixelMaxinfoSACLearner
-from jaxrl2.agents.pixel_maxinfosac_explorer.pixel_maxinfosac_explorer import PixelMaxinfoSACExplorer as PixelMaxinfoSACExplorerLearner
+from jaxrl2.agents.pixel_maxinfosac_explorer.pixel_maxinfosac_explorer import PixelMaxinfoSACExplorer
 from jaxrl2.agents.pixel_sac.pixel_sac_learner import PixelSACLearner
 from jaxrl2.utils.general_utils import add_batch_dim
 import numpy as np
@@ -42,7 +42,7 @@ compilation_cache.initialize_cache(os.path.join(home_dir, 'jax_compilation_cache
 LEARNER_BY_ALGORITHM = {
     'pixel_sac': PixelSACLearner,
     'pixel_maxinfosac': PixelMaxinfoSACLearner,
-    'pixel_maxinfosac_explorer': PixelMaxinfoSACExplorerLearner,
+    'pixel_maxinfosac_explorer': PixelMaxinfoSACExplorer,
 }
 
 

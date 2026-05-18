@@ -1,3 +1,6 @@
-from jaxrl2.agents.pixel_maxinfosac.pixel_maxinfosac_learner import PixelMaxinfoSACLearner
+from jaxrl2.agents.pixel_maxinfosac_explorer.pixel_maxinfosac_explorer import (
+    PixelMaxinfoSACExplorer,
+)
 
-PixelSACLearner = PixelMaxinfoSACLearner
+PixelMaxinfoSACLearner = PixelMaxinfoSACExplorer
+PixelSACLearner = PixelMaxinfoSACExplorer

@@ -13,7 +13,7 @@ from jaxrl2.utils.launch_util import (
 
 
 ENTITY = 'kiten'
-PROJECT_NAME = 'DSRL_pi0_Libero_May_17_20_00_Explorer'
+PROJECT_NAME = 'DSRL_pi0_Libero_March_11_23_55_rtx4090'
 MODULE_NAME = 'examples.launch_train_sim'
 
 
@@ -72,7 +72,7 @@ SWEEP_FLAGS = {
     # 'mask_expl_critic': [1, 0],
     'libero_suite': ['libero_90'],
     'libero_task_id': [
-        58
+        58, 47
     ],
 }
 

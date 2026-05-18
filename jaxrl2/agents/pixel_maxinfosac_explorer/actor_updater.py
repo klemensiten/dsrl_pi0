@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 from flax.training.train_state import TrainState
 
-from jaxrl2.agents.pixel_maxinfosac.ensemble_utils import ensemble_inputs
+from jaxrl2.agents.pixel_maxinfosac_explorer.ensemble_utils import ensemble_inputs
 from jaxrl2.data.dataset import DatasetDict
 from jaxrl2.networks.ensemble_model import DeterministicEnsemble, EnsembleState
 from jaxrl2.types import Params, PRNGKey

@@ -64,10 +64,13 @@ if __name__ == '__main__':
         num_qs=10,
         action_magnitude=1.0,
         num_cameras=1,
+        explore_until=300000,
+        agent_update_period=1,
+        expl_agent_update_period=1,
+        ensemble_update_period=1,
         )
 
     variant, args = parse_training_args(train_args_dict, parser)
     print(variant)
     main(variant)
     sys.exit()
-    

@@ -148,7 +148,8 @@ def _update_critic_sac(key: PRNGKey, actor: TrainState, critic: TrainState,
                        target_critic_params: Params, temp: TrainState,
                        batch: DatasetDict, discount: float,
                        backup_entropy: bool, critic_reduction: str,
-                       q_head: str) -> Tuple[TrainState, Dict[str, float]]:
+                       q_head: str,
+                       mask_target: bool = True) -> Tuple[TrainState, Dict[str, float]]:
     dist = _apply_actor(actor, actor.params, batch['next_observations'])
     next_actions, next_log_probs = dist.sample_and_log_prob(seed=key)
 
@@ -161,11 +162,12 @@ def _update_critic_sac(key: PRNGKey, actor: TrainState, critic: TrainState,
         _select_q_head(target_qs, target_expl_qs, q_head),
         critic_reduction)
 
-    target_q = batch['rewards'] + batch["discount"] * batch['masks'] * next_q
+    bootstrap = batch["discount"] * (batch['masks'] if mask_target else 1.0)
+    target_q = batch['rewards'] + bootstrap * next_q
     act_ent_coef = temp.apply_fn({'params': temp.params})
     if backup_entropy:
         entropy_bonus = -act_ent_coef * next_log_probs
-        target_q += batch["discount"] * batch['masks'] * entropy_bonus
+        target_q += bootstrap * entropy_bonus
     else:
         entropy_bonus = jnp.zeros_like(next_log_probs)
 
@@ -284,6 +286,7 @@ def _prefix_info(prefix: str, info: Dict[str, float]) -> Dict[str, float]:
         'predict_reward',
         'predict_diff',
         'ensemble_output_modalities',
+        'mask_expl_critic',
         'update_agent',
         'update_expl_agent',
         'update_ensemble',
@@ -314,6 +317,7 @@ def _update_jit(
     predict_reward: bool,
     predict_diff: bool,
     ensemble_output_modalities: Tuple[str, ...],
+    mask_expl_critic: bool,
     update_agent: bool,
     update_expl_agent: bool,
     update_ensemble: bool,
@@ -345,7 +349,8 @@ def _update_jit(
         target_critic = critic.replace(params=target_critic_params)
         new_critic, critic_info = _update_critic_sac(
             key, actor, critic, target_critic.params, temp, batch, discount,
-            backup_entropy, critic_reduction, q_head='task')
+            backup_entropy, critic_reduction, q_head='task',
+            mask_target=True)
         new_target_critic_params = soft_target_update(
             new_critic.params, target_critic_params, tau)
 
@@ -375,7 +380,8 @@ def _update_jit(
         new_expl_critic, expl_critic_info = _update_critic_sac(
             key, expl_actor, expl_critic, expl_target_critic_params,
             expl_temp, expl_batch, discount, backup_entropy,
-            critic_reduction, q_head='expl')
+            critic_reduction, q_head='expl',
+            mask_target=mask_expl_critic)
         new_expl_target_critic_params = soft_target_update(
             new_expl_critic.params, expl_target_critic_params, tau)
 
@@ -671,19 +677,49 @@ class PixelMaxinfoSACExplorer(Agent):
             self.target_entropy = float(target_entropy)
         print(f'target_entropy: {self.target_entropy}')
         print(self.critic_reduction)
-        
+
+    @property
+    def collecting_exploration(self) -> bool:
+        return self._step <= self.explore_until
+
+    def sample_actions(self, observations: np.ndarray) -> np.ndarray:
+        actor = self._expl_actor if self.collecting_exploration else self._actor
+        rng, actions = sample_actions_jit(
+            self._rng,
+            actor.apply_fn,
+            actor.params,
+            observations,
+            get_batch_stats(actor))
+        self._rng = rng
+        if self.collecting_exploration:
+            self._exploration_steps += 1
+        return np.asarray(actions)
 
     def update(self, batch: FrozenDict) -> Dict[str, float]:
+        self._step += 1
+        update_agent = self._step % self.agent_update_period == 0
+        update_expl_agent = (
+            self.collecting_exploration and
+            self._step % self.expl_agent_update_period == 0)
+        update_ensemble = self._step % self.ensemble_update_period == 0
+
         new_rng, new_actor, new_critic, new_target_actor, new_target_critic, \
-            new_temp, new_dyn_ent_temp, new_ens_state, info = _update_jit(
+            new_temp, new_expl_actor, new_expl_critic, \
+            new_expl_target_actor, new_expl_target_critic, new_expl_temp, \
+            new_ens_state, info = _update_jit(
                 self._rng, self._actor, self._critic,
                 self._target_actor_params, self._target_critic_params,
-                self._temp, self._dyn_ent_temp, self._ensemble, self._ens_state, batch,
+                self._temp, self._expl_actor, self._expl_critic,
+                self._expl_target_actor_params,
+                self._expl_target_critic_params, self._expl_temp,
+                self._ensemble, self._ens_state, batch,
                 self.discount, self.tau, self.target_entropy,
                 self.critic_reduction, self.color_jitter, self.aug_next,
-                self.num_cameras, self.backup_entropy, self.model_obs_key,
+                self.num_cameras, self.backup_entropy,
                 self.predict_reward, self.predict_diff,
-                self._ensemble_output_modalities, self.mask_expl_critic
+                self._ensemble_output_modalities,
+                self.mask_expl_critic,
+                update_agent, update_expl_agent, update_ensemble
             )
 
         self._rng = new_rng
@@ -692,9 +728,19 @@ class PixelMaxinfoSACExplorer(Agent):
         self._target_actor_params = new_target_actor
         self._target_critic_params = new_target_critic
         self._temp = new_temp
-        self._dyn_ent_temp = new_dyn_ent_temp
+        self._expl_actor = new_expl_actor
+        self._expl_critic = new_expl_critic
+        self._expl_target_actor_params = new_expl_target_actor
+        self._expl_target_critic_params = new_expl_target_critic
+        self._expl_temp = new_expl_temp
         self._ens_state = new_ens_state
-        return info
+        return {
+            **info,
+            'policy_phase': jnp.asarray(int(self.collecting_exploration)),
+            'exploration_steps': jnp.asarray(self._exploration_steps),
+            'expl_update_active': jnp.asarray(int(update_expl_agent)),
+            'learner_step': jnp.asarray(self._step),
+        }
 
     def perform_eval(self, variant, i, wandb_logger, eval_buffer, eval_buffer_iterator, eval_env):
         from examples.train_utils_sim import make_multiple_value_reward_visulizations
@@ -742,8 +788,14 @@ class PixelMaxinfoSACExplorer(Agent):
             'target_critic_params': self._target_critic_params,
             'actor': self._actor,
             'temp': self._temp,
-            'dyn_ent_temp': self._dyn_ent_temp,
+            'expl_actor': self._expl_actor,
+            'expl_critic': self._expl_critic,
+            'expl_target_actor_params': self._expl_target_actor_params,
+            'expl_target_critic_params': self._expl_target_critic_params,
+            'expl_temp': self._expl_temp,
             'ens_state': self._ens_state,
+            'step': self._step,
+            'exploration_steps': self._exploration_steps,
         }
         return save_dict
 
@@ -755,8 +807,17 @@ class PixelMaxinfoSACExplorer(Agent):
         self._target_actor_params = output_dict['target_actor_params']
         self._target_critic_params = output_dict['target_critic_params']
         self._temp = output_dict['temp']
-        self._dyn_ent_temp = output_dict['dyn_ent_temp']
+        self._expl_actor = output_dict.get('expl_actor', self._expl_actor)
+        self._expl_critic = output_dict.get('expl_critic', self._expl_critic)
+        self._expl_target_actor_params = output_dict.get(
+            'expl_target_actor_params', self._expl_target_actor_params)
+        self._expl_target_critic_params = output_dict.get(
+            'expl_target_critic_params', self._expl_target_critic_params)
+        self._expl_temp = output_dict.get('expl_temp', self._expl_temp)
         self._ens_state = output_dict['ens_state']
+        self._step = int(output_dict.get('step', self._step))
+        self._exploration_steps = int(
+            output_dict.get('exploration_steps', self._exploration_steps))
         print('restored from ', dir)
         
 
@@ -813,3 +874,7 @@ def make_visual(q_estimates, rewards, masks, images):
 
     plt.close(fig)
     return out_image
+
+
+PixelMaxinfoSACLearner = PixelMaxinfoSACExplorer
+PixelSACLearner = PixelMaxinfoSACExplorer
