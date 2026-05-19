@@ -4,3 +4,6 @@
 [submodule "openpi"]
 	path = openpi
 	url = git@github.com:nakamotoo/openpi.git
+[submodule "tactile_envs"]
+	path = tactile_envs
+	url = git@github.com:carlosferrazza/tactile_envs.git
