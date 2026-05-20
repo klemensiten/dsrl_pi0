@@ -21,7 +21,7 @@ from typing import Any
 from jaxrl2.agents.agent import Agent, get_batch_stats
 from jaxrl2.agents.common import sample_actions_jit
 from jaxrl2.data.augmentations import batched_random_crop, color_transform
-from jaxrl2.networks.encoders.networks import Encoder, PixelMultiplexer
+from jaxrl2.networks.encoders.networks import Encoder
 from jaxrl2.networks.encoders.impala_encoder import ImpalaEncoder, SmallerImpalaEncoder
 from jaxrl2.networks.encoders.resnet_encoderv1 import ResNet18, ResNet34, ResNetSmall
 from jaxrl2.networks.encoders.resnet_encoderv2 import ResNetV2Encoder
@@ -33,7 +33,10 @@ from jaxrl2.agents.pixel_maxinfosac_explorer.ensemble_utils import (
     flatten_actions,
     modality_output_slices,
 )
-from jaxrl2.agents.pixel_maxinfosac_explorer.networks import PixelMaxInfoCritic
+from jaxrl2.agents.pixel_maxinfosac_explorer.networks import (
+    PixelMaxInfoCritic,
+    PixelTactileMultiplexer,
+)
 from jaxrl2.agents.pixel_maxinfosac_explorer.temperature_updater import update_temperature
 from jaxrl2.agents.pixel_maxinfosac_explorer.temperature import Temperature
 from jaxrl2.data.dataset import DatasetDict
@@ -549,11 +552,18 @@ class PixelMaxinfoSACExplorer(Agent):
         
         policy_def = LearnedStdTanhNormalPolicy(hidden_dims, self.action_dim, dropout_rate=dropout_rate, low=-action_magnitude, high=action_magnitude)
 
-        actor_def = PixelMultiplexer(encoder=encoder_def,
-                                     network=policy_def,
-                                     latent_dim=latent_dim,
-                                     use_bottleneck=use_bottleneck
-                                     )
+        actor_def = PixelTactileMultiplexer(
+            encoder=encoder_def,
+            network=policy_def,
+            latent_dim=latent_dim,
+            use_bottleneck=use_bottleneck,
+            obs_dim=obs_dim,
+            tactile_hidden_dims=tactile_hidden_dims,
+            tactile_cnn_features=cnn_features,
+            tactile_cnn_strides=cnn_strides,
+            tactile_cnn_padding=cnn_padding,
+            mask_touch=mask_touch,
+        )
         print(actor_def)
         actor_def_init = actor_def.init(actor_key, observations)
         actor_params = actor_def_init['params']

@@ -1,5 +1,10 @@
 import argparse
 import sys
+
+from examples.sim_path_bootstrap import bootstrap_sim_paths
+
+bootstrap_sim_paths()
+
 from examples.train_sim import main
 from jaxrl2.utils.launch_util import parse_training_args
 
@@ -17,6 +22,12 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', default=16, help='Mini batch size.', type=int)
     parser.add_argument('--max_steps', default=int(1e6), help='Number of training steps.', type=int)
     parser.add_argument('--add_states', default=1, help='whether to add low-dim states to the obervations', type=int)
+    parser.add_argument('--add_tactile', default=0, help='whether to add tactile observations', type=int)
+    parser.add_argument('--use_touch', default=0, help='whether to use the tactile robosuite gripper', type=int)
+    parser.add_argument('--touch_gripper_type', default='Robotiq85TactileGripper', help='robosuite gripper type to use when --use_touch=1')
+    parser.add_argument('--tactile_shape', nargs=3, default=(32, 64, 3), type=int, help='image-style tactile observation shape H W C')
+    parser.add_argument('--gripper_state_dim', default=2, help='number of gripper qpos values fed into the LIBERO state', type=int)
+    parser.add_argument('--gripper_state_indices', nargs='*', default=None, type=int, help='optional robot0_gripper_qpos indices used for the compact LIBERO state')
     parser.add_argument('--wandb_project', default='cql_sim_online', help='wandb project')
     parser.add_argument('--start_online_updates', default=1000, help='number of steps to collect before starting online updates', type=int)
     parser.add_argument('--algorithm', default='pixel_sac', help='type of algorithm')

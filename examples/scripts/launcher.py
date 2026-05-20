@@ -13,11 +13,16 @@ from jaxrl2.utils.launch_util import (
 
 
 ENTITY = 'kiten'
-PROJECT_NAME = 'DSRL_pi0_Libero_March_11_10_00  '  # Make sure to change this for your sweep!           
+PROJECT_NAME = 'DSRL_pi0_Libero_May_20_14_30_Test_Touch_Robotiq'
 MODULE_NAME = 'examples.launch_train_sim'
 
 
-# Edit this block to change the base experiment.
+def _int_list_from_env(name, default):
+    value = os.environ.get(name, default)
+    return [int(v) for v in value.replace(',', ' ').split()]
+
+
+# base experiment.
 BASE_FLAGS = {
     'algorithm': 'pixel_maxinfosac',
     'env': 'libero',
@@ -32,6 +37,13 @@ BASE_FLAGS = {
     'multi_grad_step': 20,
     'start_online_updates': 500,
     'resize_image': 64,
+    'add_tactile': 1,
+    'use_touch': 1,
+    'touch_gripper_type': os.environ.get(
+        'touch_gripper_type', 'Robotiq85TactileGripper'),
+    'tactile_shape': _int_list_from_env('tactile_shape', '32 64 3'),
+    'gripper_state_indices': _int_list_from_env(
+        'gripper_state_indices', '0 3'),
     'action_magnitude': 1.0,
     'query_freq': 20,
     'hidden_dims': [128],
@@ -54,20 +66,39 @@ BASE_FLAGS = {
 }
 
 
-# Edit this block to choose the sweep. Values are combined as a Cartesian product.
-# For example, uncommenting dyn_ent_lr below launches every seed x dyn_ent_lr pair.
 SWEEP_FLAGS = {
     'seed': [0, 1, 2, 3, 4],
-    'dyn_ent_lr': [0.0001, 0.0003, 0.0],
-    'init_dyn_ent_temperature': [0.1, 1.0, 0.00000001],
-    'model_lr': [0.001, 0.0003, 0.0],
-    'model_wd': [0.0001, 0.0],
+    'dyn_ent_lr': [0.0003],
+    'init_dyn_ent_temperature': [1.0],
+    'model_lr': [0.001],
+    'model_wd': [0.0001],
     # 'model_hidden_dims': [[512, 512], [256, 256]],
     # 'num_model_heads': [7, 5, 1],
     # 'predict_reward': [1, 0],
     # 'backup_entropy': [1, 0],
-    'ensemble_disagreement_modalities': ['image'],
+    'ensemble_disagreement_modalities': [
+        'state', 'latent', 'image', 'tactile', 'latent,state',
+        'latent,image', 'latent,tactile', 'state,image',
+        'state,tactile', 'image,tactile', ''
+    ],
     # 'mask_expl_critic': [1, 0],
+    'libero_suite': ['libero_90'],
+    'libero_task_id': [
+        58,
+        # # Most similar to task 58: single-object pickup into tray/basket.
+        # 55, 56, 60, 61, 62,
+        # 46, 48, 49, 50, 51, 52, 53, 54,
+        # # Drawer/cabinet manipulation and placement.
+        # 0, 8, 23, 24,
+        # # Plate/tabletop placement and bowl stacking.
+        # 16, 36, 65, 69,
+        # # Appliance/stove and shelf/top/under placement.
+        # 21, 35, 45,
+        # # Caddy compartment placement.
+        # 73, 77, 84,
+        # # Book shelf spatial relations.
+        # 86, 87, 89,
+    ],
 }
 
 
@@ -100,7 +131,7 @@ def parse_args():
     parser.add_argument('--exp_dir', type=str, default=None)
     parser.add_argument('--num_cpus', type=int, default=1)
     parser.add_argument('--num_gpus', type=int, default=1)
-    parser.add_argument('--gpu_type', type=str, default='rtx_3090')
+    parser.add_argument('--gpu_type', type=str, default='rtx_4090')
     parser.add_argument('--mem', type=int, default=32000)
     parser.add_argument('--duration', type=str, default=None)
     parser.add_argument('--mode', type=str, default='euler',

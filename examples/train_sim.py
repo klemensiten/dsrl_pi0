@@ -1,5 +1,10 @@
 #! /usr/bin/env python
 import os
+
+from examples.sim_path_bootstrap import bootstrap_sim_paths
+
+bootstrap_sim_paths()
+
 # Tell XLA to use Triton GEMM, this improves steps/sec by ~30% on some GPUs from https://github.com/huggingface/gym-aloha/tree/main?tab=readme-ov-file#-gpu-rendering-egl
 xla_flags = os.environ.get('XLA_FLAGS', '')
 xla_flags += ' --xla_gpu_triton_gemm_any=True'
@@ -27,7 +32,11 @@ from jaxrl2.data import ReplayBuffer
 from jaxrl2.utils.wandb_logger import WandBLogger, create_exp_name
 import tempfile
 from functools import partial
-from examples.train_utils_sim import trajwise_alternating_training_loop
+from examples.train_utils_sim import (
+    get_libero_state_dim,
+    get_tactile_shape,
+    trajwise_alternating_training_loop,
+)
 import tensorflow as tf
 from jax.experimental.compilation_cache import compilation_cache
 
@@ -90,11 +99,18 @@ def _make_agent(variant, sample_obs, sample_action):
                        **learner_kwargs)
 
 
-def _get_libero_env(task, resolution, seed):
+def _get_libero_env(
+        task,
+        resolution,
+        seed,
+        use_touch=False,
+        touch_gripper_type="Robotiq85TactileGripper"):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
     task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
     env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
+    if use_touch:
+        env_args["gripper_types"] = touch_gripper_type
     env = OffScreenRenderEnv(**env_args)
     env.seed(seed)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description
@@ -123,10 +139,20 @@ class DummyEnv(gym.ObservationWrapper):
         obs_dict['pixels'] = Box(low=0, high=255, shape=self.image_shape, dtype=np.uint8)
         if variant.add_states:
             if variant.env == 'libero':
-                state_dim = 8
+                state_dim = get_libero_state_dim(variant)
             elif variant.env == 'aloha_cube':
                 state_dim = 14
             obs_dict['state'] = Box(low=-1.0, high=1.0, shape=(state_dim, 1), dtype=np.float32)
+        if getattr(variant, 'add_tactile', 0):
+            if variant.env != 'libero':
+                raise NotImplementedError('Tactile observations are only wired for LIBERO.')
+            tactile_shape = (*get_tactile_shape(variant), 1)
+            obs_dict['tactile'] = Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=tactile_shape,
+                dtype=np.float32,
+            )
         self.observation_space = Dict(obs_dict)
         self.action_space = Box(low=-1, high=1, shape=(1, 32,), dtype=np.float32) # 32 is the noise action space of pi 0
 
@@ -172,7 +198,14 @@ def main(variant):
                 f"Supported suites: {supported_suites}.")
         task_suite = benchmark_dict[variant.libero_suite]()
         task = task_suite.get_task(variant.libero_task_id)
-        env, task_description = _get_libero_env(task, 256, variant.seed)
+        touch_gripper_type = getattr(
+            variant, 'touch_gripper_type', 'Robotiq85TactileGripper')
+        env, task_description = _get_libero_env(
+            task,
+            256,
+            variant.seed,
+            use_touch=bool(getattr(variant, 'use_touch', 0)),
+            touch_gripper_type=touch_gripper_type)
         eval_env = env
         variant.task_description = task_description
         print(

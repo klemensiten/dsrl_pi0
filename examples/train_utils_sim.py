@@ -55,7 +55,7 @@ def obs_to_pi_zero_input(obs, variant):
                             (
                                 obs["robot0_eef_pos"],
                                 _quat2axisangle(obs["robot0_eef_quat"]),
-                                obs["robot0_gripper_qpos"],
+                                obs_to_gripper_qpos(obs, variant),
                             )
                         ),
                         "prompt": str(variant.task_description),
@@ -79,7 +79,7 @@ def obs_to_qpos(obs, variant):
             (
                 obs["robot0_eef_pos"],
                 _quat2axisangle(obs["robot0_eef_quat"]),
-                obs["robot0_gripper_qpos"],
+                obs_to_gripper_qpos(obs, variant),
             )
         )
     elif variant.env == 'aloha_cube':
@@ -87,6 +87,101 @@ def obs_to_qpos(obs, variant):
     else:
         raise NotImplementedError()
     return qpos
+
+def get_libero_state_dim(variant):
+    return 6 + int(getattr(variant, 'gripper_state_dim', 2))
+
+def _parse_int_sequence(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value or value.lower() in ('none', 'auto'):
+            return None
+        value = value.replace(',', ' ').split()
+    return tuple(int(v) for v in value)
+
+def obs_to_gripper_qpos(obs, variant):
+    qpos = np.asarray(obs["robot0_gripper_qpos"], dtype=np.float32).reshape(-1)
+    target_dim = int(getattr(variant, 'gripper_state_dim', 2))
+    indices = _parse_int_sequence(getattr(variant, 'gripper_state_indices', None))
+
+    if indices is None and qpos.size == 6 and target_dim == 2:
+        # Robotiq85 exposes 6 mimic joints; use the two outer knuckle roots as
+        # a compact left/right proxy so Pi0 still receives an 8D LIBERO state.
+        indices = (0, 3)
+
+    if indices is not None:
+        selected = qpos[np.asarray(indices, dtype=np.int32)]
+        if selected.size != target_dim:
+            raise ValueError(
+                f'gripper_state_indices selected {selected.size} values, '
+                f'but gripper_state_dim is {target_dim}.')
+        return selected
+
+    if qpos.size == target_dim:
+        return qpos
+    if qpos.size > target_dim:
+        raise ValueError(
+            f'robot0_gripper_qpos has {qpos.size} values, but '
+            f'gripper_state_dim is {target_dim}. Set '
+            f'--gripper_state_indices to choose the values fed to Pi0/DSRL.')
+
+    return np.pad(qpos, (0, target_dim - qpos.size))
+
+def get_tactile_shape(variant):
+    tactile_shape = getattr(variant, 'tactile_shape', (32, 64, 3))
+    if isinstance(tactile_shape, str):
+        tactile_shape = tuple(
+            int(dim) for dim in tactile_shape.replace(',', ' ').split())
+    else:
+        tactile_shape = tuple(int(dim) for dim in tactile_shape)
+    if len(tactile_shape) != 3:
+        raise ValueError(
+            f'tactile_shape must be three image-style dims (H, W, C); '
+            f'got {tactile_shape}')
+    if tactile_shape[-1] != 3:
+        raise ValueError(
+            f'tactile_shape channel dim must be 3; got {tactile_shape}')
+    return tactile_shape
+
+def obs_to_tactile(obs, variant):
+    if variant.env != 'libero':
+        raise NotImplementedError('Tactile observations are only wired for LIBERO.')
+    if 'tactile' in obs:
+        tactile = obs['tactile']
+    elif 'tactile_left' in obs and 'tactile_right' in obs:
+        tactile = np.concatenate(
+            (obs['tactile_left'], obs['tactile_right']),
+            axis=-1,
+        )
+    else:
+        raise KeyError('LIBERO observation does not contain tactile data.')
+
+    tactile = np.asarray(tactile, dtype=np.float32)
+    if tactile.ndim == 3 and tactile.shape[0] == 3:
+        tactile = np.moveaxis(tactile, 0, -1)
+    expected_shape = get_tactile_shape(variant)
+    if tactile.shape != expected_shape:
+        raise ValueError(
+            f'Unexpected tactile observation shape: {tactile.shape}; '
+            f'expected {expected_shape}. Set --tactile_shape H W C to match '
+            f'the active gripper.')
+    return tactile
+
+def obs_to_agent_input(obs, variant, curr_image=None):
+    if curr_image is None:
+        curr_image = obs_to_img(obs, variant)
+    obs_dict = {
+        'pixels': curr_image[np.newaxis, ..., np.newaxis],
+    }
+    if variant.add_states:
+        qpos = obs_to_qpos(obs, variant)
+        obs_dict['state'] = qpos[np.newaxis, ..., np.newaxis]
+    if getattr(variant, 'add_tactile', 0):
+        tactile = obs_to_tactile(obs, variant)
+        obs_dict['tactile'] = tactile[np.newaxis, ..., np.newaxis]
+    return obs_dict
 
 def trajwise_alternating_training_loop(variant, agent, env, eval_env, online_replay_buffer, replay_buffer, wandb_logger,
                                        perform_control_evals=True, shard_fn=None, agent_dp=None):
@@ -209,18 +304,7 @@ def collect_traj(variant, agent, env, i, agent_dp=None):
 
     for t in tqdm(range(max_timesteps)):
         curr_image = obs_to_img(obs, variant)
-        
-        qpos = obs_to_qpos(obs, variant)
-
-        if variant.add_states:
-            obs_dict = {
-                'pixels': curr_image[np.newaxis, ..., np.newaxis],
-                'state': qpos[np.newaxis, ..., np.newaxis],
-            }
-        else:
-            obs_dict = {
-                'pixels': curr_image[np.newaxis, ..., np.newaxis],
-            }
+        obs_dict = obs_to_agent_input(obs, variant, curr_image=curr_image)
 
         if t % query_frequency == 0:
 
@@ -259,11 +343,7 @@ def collect_traj(variant, agent, env, i, agent_dp=None):
 
     # add last observation
     curr_image = obs_to_img(obs, variant)
-    qpos = obs_to_qpos(obs, variant)
-    obs_dict = {
-        'pixels': curr_image[np.newaxis, ..., np.newaxis],
-        'state': qpos[np.newaxis, ..., np.newaxis],
-    }
+    obs_dict = obs_to_agent_input(obs, variant, curr_image=curr_image)
     obs_list.append(obs_dict)
     image_list.append(curr_image)
     
@@ -323,16 +403,7 @@ def perform_control_eval(agent, env, i, variant, wandb_logger, agent_dp=None):
             curr_image = obs_to_img(obs, variant)
 
             if t % query_frequency == 0:
-                qpos = obs_to_qpos(obs, variant)
-                if variant.add_states:
-                    obs_dict = {
-                        'pixels': curr_image[np.newaxis, ..., np.newaxis],
-                        'state': qpos[np.newaxis, ..., np.newaxis],
-                    }
-                else:
-                    obs_dict = {
-                        'pixels': curr_image[np.newaxis, ..., np.newaxis],
-                    }
+                obs_dict = obs_to_agent_input(obs, variant, curr_image=curr_image)
 
                 rng, key = jax.random.split(rng)
                 assert agent_dp is not None
