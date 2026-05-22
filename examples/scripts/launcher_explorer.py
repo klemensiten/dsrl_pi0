@@ -13,8 +13,13 @@ from jaxrl2.utils.launch_util import (
 
 
 ENTITY = 'kiten'
-PROJECT_NAME = 'DSRL_pi0_Libero_March_11_23_55_rtx4090'
+PROJECT_NAME = 'DSRL_pi0_Libero_May_22_17_30_Test_Touch_R2'
 MODULE_NAME = 'examples.launch_train_sim'
+
+
+def _int_list_from_env(name, default):
+    value = os.environ.get(name, default)
+    return [int(v) for v in value.replace(',', ' ').split()]
 
 
 # base experiment.
@@ -32,6 +37,9 @@ BASE_FLAGS = {
     'multi_grad_step': 20,
     'start_online_updates': 500,
     'resize_image': 64,
+    'add_tactile': 1,
+    'use_touch': 1,
+    'tactile_shape': _int_list_from_env('tactile_shape', '32 64 3'),
     'action_magnitude': 1.0,
     'query_freq': 20,
     'explore_until': 300000,
@@ -57,6 +65,10 @@ BASE_FLAGS = {
 
 SWEEP_FLAGS = {
     'seed': [0, 1, 2, 3, 4],
+    'touch_gripper_type': [
+        'Robotiq85TactileGripper',
+        'PandaGripper',
+    ],
     'dyn_ent_lr': [0.0003],
     'init_dyn_ent_temperature': [1.0],
     'model_lr': [0.001],
@@ -66,8 +78,7 @@ SWEEP_FLAGS = {
     # 'predict_reward': [1, 0],
     # 'backup_entropy': [1, 0],
     'ensemble_disagreement_modalities': [
-        'state', 'latent', 'image', 'latent,state', 'latent,image',
-        'state,image', ''
+        'tactile'
     ],
     # 'mask_expl_critic': [1, 0],
     'libero_suite': ['libero_90'],
@@ -77,12 +88,20 @@ SWEEP_FLAGS = {
 }
 
 
+GRIPPER_STATE_INDICES = {
+    'Robotiq85TactileGripper': [0, 3],
+    'PandaGripper': [0, 1],
+}
+
+
 def build_flags(project_name):
     sweep_keys = list(SWEEP_FLAGS.keys())
     for sweep_flags in dict_permutations(SWEEP_FLAGS):
         flags = copy.deepcopy(BASE_FLAGS)
         flags['wandb_project'] = project_name
         flags.update(sweep_flags)
+        flags['gripper_state_indices'] = GRIPPER_STATE_INDICES[
+            flags['touch_gripper_type']]
         flags.setdefault('suffix', hash_dict(sweep_flags))
         yield flags
 
@@ -106,7 +125,7 @@ def parse_args():
     parser.add_argument('--exp_dir', type=str, default=None)
     parser.add_argument('--num_cpus', type=int, default=1)
     parser.add_argument('--num_gpus', type=int, default=1)
-    parser.add_argument('--gpu_type', type=str, default='rtx_4090')
+    parser.add_argument('--gpu_type', type=str, default='rtx_3090')
     parser.add_argument('--mem', type=int, default=32000)
     parser.add_argument('--duration', type=str, default=None)
     parser.add_argument('--mode', type=str, default='euler',
@@ -132,7 +151,13 @@ def main(args):
     pre_commands = [
         f'mkdir -p {shlex.quote(exp_dir)} {shlex.quote(slurm_dir)}',
     ]
-    env = {'EXP': exp_dir}
+    env = {
+        'EXP': exp_dir,
+        'MUJOCO_GL': 'egl',
+        'PYOPENGL_PLATFORM': 'egl',
+        'MUJOCO_EGL_DEVICE_ID': '0',
+        'XLA_PYTHON_CLIENT_PREALLOCATE': 'false',
+    }
 
     for flags in build_flags(args.project_name):
         command_list.append(

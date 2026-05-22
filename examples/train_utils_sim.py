@@ -5,6 +5,7 @@ import jax
 from openpi_client import image_tools
 import math
 import PIL
+from PIL import Image
 
 def _quat2axisangle(quat):
     """
@@ -168,6 +169,40 @@ def obs_to_tactile(obs, variant):
             f'expected {expected_shape}. Set --tactile_shape H W C to match '
             f'the active gripper.')
     return tactile
+
+def tactile_to_heatmap(tactile, max_value, output_size):
+    tactile = np.asarray(tactile, dtype=np.float32)
+    values = np.linalg.norm(tactile, axis=-1)
+    scale = max(float(max_value), 1e-8)
+    values = np.clip(values / scale, 0.0, 1.0)
+
+    heatmap = np.zeros((*values.shape, 3), dtype=np.float32)
+    heatmap[..., 0] = np.clip(3.0 * values - 1.5, 0.0, 1.0)
+    heatmap[..., 1] = np.clip(3.0 * values - 0.5, 0.0, 1.0)
+    heatmap[..., 2] = np.clip(4.0 * values, 0.0, 1.0) * (1.0 - np.clip(2.0 * values - 1.0, 0.0, 1.0))
+    heatmap = (255.0 * heatmap).astype(np.uint8)
+
+    if heatmap.shape[1] >= 2:
+        split = heatmap.shape[1] // 2
+        heatmap[:, split - 1:split + 1] = 255
+
+    return np.asarray(
+        Image.fromarray(heatmap).resize(output_size, Image.Resampling.NEAREST),
+        dtype=np.uint8,
+    )
+
+def tactile_video_from_list(tactile_list, output_size):
+    if not tactile_list:
+        return None
+    max_value = max(
+        float(np.linalg.norm(np.asarray(tactile), axis=-1).max())
+        for tactile in tactile_list
+    )
+    frames = [
+        tactile_to_heatmap(tactile, max_value, output_size)
+        for tactile in tactile_list
+    ]
+    return np.stack(frames).transpose(0, 3, 1, 2)
 
 def obs_to_agent_input(obs, variant, curr_image=None):
     if curr_image is None:
@@ -396,11 +431,15 @@ def perform_control_eval(agent, env, i, variant, wandb_logger, agent_dp=None):
             obs, _ = env.reset()
             
         image_list = [] # for visualization
+        log_eval_tactile = 'libero' in variant.env and bool(
+            getattr(variant, 'use_touch', 0))
+        tactile_list = [] if log_eval_tactile else None
         rewards = []
         
 
         for t in tqdm(range(max_timesteps)):
             curr_image = obs_to_img(obs, variant)
+            curr_tactile = obs_to_tactile(obs, variant) if log_eval_tactile else None
 
             if t % query_frequency == 0:
                 obs_dict = obs_to_agent_input(obs, variant, curr_image=curr_image)
@@ -435,6 +474,8 @@ def perform_control_eval(agent, env, i, variant, wandb_logger, agent_dp=None):
                 
             rewards.append(reward)
             image_list.append(curr_image)
+            if log_eval_tactile:
+                tactile_list.append(curr_tactile)
             if done:
                 break
 
@@ -451,6 +492,13 @@ def perform_control_eval(agent, env, i, variant, wandb_logger, agent_dp=None):
         print(f'Rollout {rollout_id} : {episode_return=}, Success: {is_success}')
         video = np.stack(image_list).transpose(0, 3, 1, 2)
         wandb_logger.log({f'eval_video/{rollout_id}': wandb.Video(video, fps=50)}, step=i)
+        if log_eval_tactile:
+            height, width = image_list[0].shape[:2]
+            tactile_video = tactile_video_from_list(tactile_list, (width, height))
+            wandb_logger.log({
+                f'eval_tactile_video/{rollout_id}': wandb.Video(
+                    tactile_video, fps=50)
+            }, step=i)
 
 
     success_rate = np.mean(np.array(success_rates))
