@@ -1,4 +1,4 @@
-from typing import Dict, Sequence, Tuple
+from typing import Dict, Sequence, Tuple, Union
 
 import flax.linen as nn
 import jax.numpy as jnp
@@ -78,7 +78,7 @@ class PixelMaxInfoCritic(nn.Module):
         if self.model_obs_key in observations:
             modalities['state'] = _flatten(observations[self.model_obs_key])
         if 'tactile' in observations:
-            modalities['tactile'] = TactileEncoder(
+            tactile_embed, tactile_obs = TactileEncoder(
                 obs_dim=self.obs_dim,
                 hidden_dims=self.tactile_hidden_dims,
                 cnn_features=self.tactile_cnn_features,
@@ -86,11 +86,13 @@ class PixelMaxInfoCritic(nn.Module):
                 cnn_padding=self.tactile_cnn_padding,
                 mask_touch=self.mask_touch,
                 name='tactile_encoder',
-            )(observations['tactile'], training=training)
+            )(observations['tactile'], training=training,
+              return_obs_embedding=True)
+            modalities['tactile'] = tactile_obs
 
         critic_replacements = {'pixels': latent}
-        if 'tactile' in modalities:
-            critic_replacements['tactile'] = modalities['tactile']
+        if 'tactile' in observations:
+            critic_replacements['tactile'] = tactile_embed
         critic_observations = observations.copy(
             add_or_replace=critic_replacements)
         critic = StateActionEnsemble(
@@ -113,7 +115,9 @@ class TactileEncoder(nn.Module):
     @nn.compact
     def __call__(self,
                  tactile: jnp.ndarray,
-                 training: bool = False) -> jnp.ndarray:
+                 training: bool = False,
+                 return_obs_embedding: bool = False
+                 ) -> Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]]:
         tactile = tactile.astype(jnp.float32)
         touch = _touch_mask(tactile)
 
@@ -138,12 +142,17 @@ class TactileEncoder(nn.Module):
         else:
             x = MLP(self.hidden_dims)(_flatten(tactile), training=training)
 
+        tactile_obs = _max_pool_to_dim(x, self.obs_dim)
         tactile_embed = nn.Dense(
             self.obs_dim, kernel_init=xavier_init(), name='tactile_embed')(x)
         tactile_embed = nn.LayerNorm(name='tactile_embed_ln')(tactile_embed)
         tactile_embed = nn.tanh(tactile_embed)
         if self.mask_touch:
-            tactile_embed = touch.astype(tactile_embed.dtype) * tactile_embed
+            touch = touch.astype(tactile_embed.dtype)
+            tactile_obs = touch * tactile_obs
+            tactile_embed = touch * tactile_embed
+        if return_obs_embedding:
+            return tactile_embed, tactile_obs
         return tactile_embed
 
 
