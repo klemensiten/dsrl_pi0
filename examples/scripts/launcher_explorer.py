@@ -13,7 +13,7 @@ from jaxrl2.utils.launch_util import (
 
 
 ENTITY = 'kiten'
-PROJECT_NAME = 'DSRL_pi0_Libero_May_22_17_30_Test_Touch_R2'
+PROJECT_NAME = 'DSRL_pi0_Libero_May_26_17_30_Test_Touch_R5_AblateTouch'
 MODULE_NAME = 'examples.launch_train_sim'
 
 
@@ -64,9 +64,9 @@ BASE_FLAGS = {
 
 
 SWEEP_FLAGS = {
-    'seed': [0, 1, 2, 3, 4],
+    'seed': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
     'touch_gripper_type': [
-        'Robotiq85TactileGripper',
+        # 'Robotiq85TactileGripper',
         'PandaGripper',
     ],
     'dyn_ent_lr': [0.0003],
@@ -77,13 +77,14 @@ SWEEP_FLAGS = {
     # 'num_model_heads': [7, 5, 1],
     # 'predict_reward': [1, 0],
     # 'backup_entropy': [1, 0],
+    'explore_until': [100000],
     'ensemble_disagreement_modalities': [
         'tactile'
     ],
     # 'mask_expl_critic': [1, 0],
     'libero_suite': ['libero_90'],
     'libero_task_id': [
-        58, 47
+        58,
     ],
 }
 
@@ -125,7 +126,7 @@ def parse_args():
     parser.add_argument('--exp_dir', type=str, default=None)
     parser.add_argument('--num_cpus', type=int, default=1)
     parser.add_argument('--num_gpus', type=int, default=1)
-    parser.add_argument('--gpu_type', type=str, default='rtx_3090')
+    parser.add_argument('--gpu_type', type=str, default='rtx_4090')
     parser.add_argument('--mem', type=int, default=32000)
     parser.add_argument('--duration', type=str, default=None)
     parser.add_argument('--mode', type=str, default='euler',

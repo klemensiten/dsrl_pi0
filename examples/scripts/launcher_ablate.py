@@ -8,6 +8,7 @@ from jaxrl2.utils.launch_util import (
     dict_permutations,
     generate_base_command,
     generate_run_commands,
+    hash_dict,
 )
 
 
@@ -15,15 +16,17 @@ ENTITY = 'kiten'
 PROJECT_NAME = 'DSRL_pi0_Libero_May_26_17_30_Test_Touch_R5_AblateTouch'
 MODULE_NAME = 'examples.launch_train_sim'
 
+
 def _int_list_from_env(name, default):
     value = os.environ.get(name, default)
     return [int(v) for v in value.replace(',', ' ').split()]
 
-# Edit this block to change the base experiment.
+
+# base experiment.
 BASE_FLAGS = {
-    'algorithm': 'pixel_sac',
+    'algorithm': 'pixel_maxinfosac',
     'env': 'libero',
-    'prefix': 'dsrl_pi0_libero',
+    'prefix': 'dsrl_pi0_libero_maxinfo',
     'wandb_project': PROJECT_NAME,
     'batch_size': 256,
     'discount': 0.999,
@@ -40,35 +43,76 @@ BASE_FLAGS = {
     'action_magnitude': 1.0,
     'query_freq': 20,
     'hidden_dims': [128],
+    'dyn_ent_lr': 0.0003,
+    'init_dyn_ent_temperature': 1.0,
+    'model_lr': 0.001,
+    'model_wd': 0.0001,
+    'model_hidden_dims': [256, 256],
+    'num_model_heads': 5,
+    'model_noise_var': 1.0,
+    'predict_reward': 1,
+    'predict_diff': 1,
+    'backup_entropy': 1,
+    'model_obs_key': 'state',
+    'obs_dim': 64,
+    'ensemble_disagreement_modalities': 'image',
+    'mask_expl_critic': 1,
     'tactile_hidden_dims': [256, 256],
     'mask_touch': 0,
 }
 
 
-# Edit this block to choose the sweep. Values are combined as a Cartesian product.
-# For example, uncommenting dyn_ent_lr below launches every seed x dyn_ent_lr pair.
-SWEEP_FLAGS = {
-    'seed': [0,1,2,3,4,5,6,7,8,9],
+SWEEP_FLAGS_TOUCH = {
+    'seed': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
     'touch_gripper_type': [
         'PandaGripper',
     ],
-    # 'dyn_ent_lr': [0.0001, 0.0003, 0.0],
-    # 'init_dyn_ent_temperature': [0.1, 1.0, 0.00000001],
-    # 'model_lr': [0.001, 0.0003, 0.0],
-    # 'model_wd': [0.0001, 0.0],
+    'dyn_ent_lr': [0.0003],
+    'init_dyn_ent_temperature': [1.0],
+    'model_lr': [0.001],
+    'model_wd': [0.0001],
     # 'model_hidden_dims': [[512, 512], [256, 256]],
     # 'num_model_heads': [7, 5, 1],
     # 'predict_reward': [1, 0],
     # 'backup_entropy': [1, 0],
-    # 'ensemble_disagreement_modalities': ['latent,state', ''],
+    'add_tactile': [1],
+    'ensemble_disagreement_modalities': [
+        'tactile',
+        'latent,tactile', 'state,tactile', 'image,tactile', 
+        'latent,state,tactile', 'image,latent,tactile', 'image,state,tactile', 
+        ''
+    ],
     # 'mask_expl_critic': [1, 0],
-    'add_tactile': [0, 1],
     'libero_suite': ['libero_90'],
     'libero_task_id': [
-        # Most similar to task 58: single-object pickup into tray/basket.
         58,
-        # Appliance/stove and shelf/top/under placement.
-        ],
+    ],
+}
+
+SWEEP_FLAGS_BASE = {
+    'seed': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    'touch_gripper_type': [
+        'PandaGripper',
+    ],
+    'dyn_ent_lr': [0.0003],
+    'init_dyn_ent_temperature': [1.0],
+    'model_lr': [0.001],
+    'model_wd': [0.0001],
+    # 'model_hidden_dims': [[512, 512], [256, 256]],
+    # 'num_model_heads': [7, 5, 1],
+    # 'predict_reward': [1, 0],
+    # 'backup_entropy': [1, 0],
+    'add_tactile': [0, 1],
+    'ensemble_disagreement_modalities': [
+        'state', 'latent', 'image',
+        'latent,state', 'latent,image', 'state,image',
+        'latent,state,image',
+    ],
+    # 'mask_expl_critic': [1, 0],
+    'libero_suite': ['libero_90'],
+    'libero_task_id': [
+        58,
+    ],
 }
 
 
@@ -79,32 +123,14 @@ GRIPPER_STATE_INDICES = {
 
 
 def build_flags(project_name):
-    sweep_keys = list(SWEEP_FLAGS.keys())
-    for sweep_flags in dict_permutations(SWEEP_FLAGS):
+    for sweep_flags in dict_permutations(SWEEP_FLAGS_TOUCH) + dict_permutations(SWEEP_FLAGS_BASE):
         flags = copy.deepcopy(BASE_FLAGS)
         flags['wandb_project'] = project_name
         flags.update(sweep_flags)
         flags['gripper_state_indices'] = GRIPPER_STATE_INDICES[
             flags['touch_gripper_type']]
-        flags.setdefault('suffix', make_suffix(flags, sweep_keys))
+        flags.setdefault('suffix', hash_dict(sweep_flags))
         yield flags
-
-
-def make_suffix(flags, sweep_keys):
-    suffix_parts = []
-    for key in sweep_keys:
-        if key == 'seed':
-            continue
-        suffix_parts.append(f'{key}_{format_value(flags[key])}')
-    if not suffix_parts:
-        return '_'
-    return slug('_'.join(suffix_parts))
-
-
-def format_value(value):
-    if isinstance(value, (list, tuple)):
-        return 'x'.join(format_value(item) for item in value)
-    return str(value)
 
 
 def slug(value):

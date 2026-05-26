@@ -28,6 +28,7 @@ from jaxrl2.agents.pixel_sac.actor_updater import update_actor
 from jaxrl2.agents.pixel_sac.critic_updater import update_critic
 from jaxrl2.agents.pixel_sac.temperature_updater import update_temperature
 from jaxrl2.agents.pixel_sac.temperature import Temperature
+from jaxrl2.agents.pixel_maxinfosac.networks import PixelTactileMultiplexer
 from jaxrl2.data.dataset import DatasetDict
 from jaxrl2.networks.learned_std_normal_policy import LearnedStdTanhNormalPolicy
 from jaxrl2.networks.values import StateActionEnsemble
@@ -120,6 +121,9 @@ class PixelSACLearner(Agent):
                  aug_next=True,
                  use_bottleneck=True,
                  init_temperature: float = 1.0,
+                 obs_dim: int = 64,
+                 tactile_hidden_dims: Sequence[int] = (256, 256),
+                 mask_touch: bool = False,
                  num_qs: int = 2,
                  target_entropy: float = None,
                  action_magnitude: float = 1.0,
@@ -174,11 +178,26 @@ class PixelSACLearner(Agent):
         
         policy_def = LearnedStdTanhNormalPolicy(hidden_dims, self.action_dim, dropout_rate=dropout_rate, low=-action_magnitude, high=action_magnitude)
 
-        actor_def = PixelMultiplexer(encoder=encoder_def,
-                                     network=policy_def,
-                                     latent_dim=latent_dim,
-                                     use_bottleneck=use_bottleneck
-                                     )
+        has_tactile = isinstance(observations, (dict, FrozenDict)) and 'tactile' in observations
+        if has_tactile:
+            actor_def = PixelTactileMultiplexer(
+                encoder=encoder_def,
+                network=policy_def,
+                latent_dim=latent_dim,
+                use_bottleneck=use_bottleneck,
+                obs_dim=obs_dim,
+                tactile_hidden_dims=tactile_hidden_dims,
+                tactile_cnn_features=cnn_features,
+                tactile_cnn_strides=cnn_strides,
+                tactile_cnn_padding=cnn_padding,
+                mask_touch=mask_touch,
+            )
+        else:
+            actor_def = PixelMultiplexer(encoder=encoder_def,
+                                         network=policy_def,
+                                         latent_dim=latent_dim,
+                                         use_bottleneck=use_bottleneck
+                                         )
         print(actor_def)
         actor_def_init = actor_def.init(actor_key, observations)
         actor_params = actor_def_init['params']
@@ -190,11 +209,25 @@ class PixelSACLearner(Agent):
                                   batch_stats=actor_batch_stats)
 
         critic_def = StateActionEnsemble(hidden_dims, num_qs=num_qs)
-        critic_def = PixelMultiplexer(encoder=encoder_def,
-                                      network=critic_def,
-                                      latent_dim=latent_dim,
-                                      use_bottleneck=use_bottleneck
-                                      )
+        if has_tactile:
+            critic_def = PixelTactileMultiplexer(
+                encoder=encoder_def,
+                network=critic_def,
+                latent_dim=latent_dim,
+                use_bottleneck=use_bottleneck,
+                obs_dim=obs_dim,
+                tactile_hidden_dims=tactile_hidden_dims,
+                tactile_cnn_features=cnn_features,
+                tactile_cnn_strides=cnn_strides,
+                tactile_cnn_padding=cnn_padding,
+                mask_touch=mask_touch,
+            )
+        else:
+            critic_def = PixelMultiplexer(encoder=encoder_def,
+                                          network=critic_def,
+                                          latent_dim=latent_dim,
+                                          use_bottleneck=use_bottleneck
+                                          )
         print(critic_def)
         critic_def_init = critic_def.init(critic_key, observations, actions)
         self._critic_init_params = critic_def_init['params']
