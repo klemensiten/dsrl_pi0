@@ -91,6 +91,8 @@ TRAIN_KWARGS_DEFAULTS = {
 
 
 PRESET_CHOICES = ("sac", "ablate")
+FALLBACK_PI0_ACTION_HORIZON = 50
+FALLBACK_PI0_NOISE_DIM = 32
 RUN_DIR_RE = re.compile(
     r"^(?P<prefix>.+)_"
     r"\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2}_"
@@ -385,24 +387,17 @@ def import_runtime():
     from openpi.training import config as openpi_config
 
     from examples.train_sim import DummyEnv, _get_libero_env, _make_agent
-    from examples.train_utils_sim import (
-        DEFAULT_PI0_ACTION_HORIZON,
-        DEFAULT_PI0_NOISE_DIM,
-        action_bounds_to_config_list,
-        apply_residual_delta,
-        compute_residual_delta_bounds,
-        get_actual_action_dim,
-        get_dsrl_action_mode,
-        get_env_action_bounds,
-        get_pi0_action_horizon,
-        get_pi0_noise_dim,
-        infer_actual_action_dim,
-        make_dsrl_components,
-        obs_to_agent_input,
-        obs_to_img,
-        obs_to_pi_zero_input,
-        obs_to_tactile,
-        tactile_to_heatmap,
+    from examples import train_utils_sim
+
+    DEFAULT_PI0_ACTION_HORIZON = getattr(
+        train_utils_sim,
+        "DEFAULT_PI0_ACTION_HORIZON",
+        FALLBACK_PI0_ACTION_HORIZON,
+    )
+    DEFAULT_PI0_NOISE_DIM = getattr(
+        train_utils_sim,
+        "DEFAULT_PI0_NOISE_DIM",
+        FALLBACK_PI0_NOISE_DIM,
     )
 
     try:
@@ -423,22 +418,47 @@ def import_runtime():
         "_make_agent": _make_agent,
         "DEFAULT_PI0_ACTION_HORIZON": DEFAULT_PI0_ACTION_HORIZON,
         "DEFAULT_PI0_NOISE_DIM": DEFAULT_PI0_NOISE_DIM,
-        "action_bounds_to_config_list": action_bounds_to_config_list,
-        "apply_residual_delta": apply_residual_delta,
-        "compute_residual_delta_bounds": compute_residual_delta_bounds,
-        "get_actual_action_dim": get_actual_action_dim,
-        "get_dsrl_action_mode": get_dsrl_action_mode,
-        "get_env_action_bounds": get_env_action_bounds,
-        "get_pi0_action_horizon": get_pi0_action_horizon,
-        "get_pi0_noise_dim": get_pi0_noise_dim,
-        "infer_actual_action_dim": infer_actual_action_dim,
-        "make_dsrl_components": make_dsrl_components,
-        "obs_to_agent_input": obs_to_agent_input,
-        "obs_to_img": obs_to_img,
-        "obs_to_pi_zero_input": obs_to_pi_zero_input,
-        "obs_to_tactile": obs_to_tactile,
-        "tactile_to_heatmap": tactile_to_heatmap,
+        "action_bounds_to_config_list": _required_attr(
+            train_utils_sim, "action_bounds_to_config_list"),
+        "apply_residual_delta": _required_attr(
+            train_utils_sim, "apply_residual_delta"),
+        "compute_residual_delta_bounds": _required_attr(
+            train_utils_sim, "compute_residual_delta_bounds"),
+        "get_actual_action_dim": _required_attr(
+            train_utils_sim, "get_actual_action_dim"),
+        "get_dsrl_action_mode": _required_attr(
+            train_utils_sim, "get_dsrl_action_mode"),
+        "get_env_action_bounds": _required_attr(
+            train_utils_sim, "get_env_action_bounds"),
+        "get_pi0_action_horizon": getattr(
+            train_utils_sim, "get_pi0_action_horizon",
+            lambda agent_dp=None: int(getattr(
+                agent_dp, "action_horizon", DEFAULT_PI0_ACTION_HORIZON))),
+        "get_pi0_noise_dim": getattr(
+            train_utils_sim, "get_pi0_noise_dim",
+            lambda agent_dp=None: int(getattr(
+                agent_dp, "action_dim", DEFAULT_PI0_NOISE_DIM))),
+        "infer_actual_action_dim": _required_attr(
+            train_utils_sim, "infer_actual_action_dim"),
+        "make_dsrl_components": _required_attr(
+            train_utils_sim, "make_dsrl_components"),
+        "obs_to_agent_input": _required_attr(train_utils_sim, "obs_to_agent_input"),
+        "obs_to_img": _required_attr(train_utils_sim, "obs_to_img"),
+        "obs_to_pi_zero_input": _required_attr(
+            train_utils_sim, "obs_to_pi_zero_input"),
+        "obs_to_tactile": _required_attr(train_utils_sim, "obs_to_tactile"),
+        "tactile_to_heatmap": _required_attr(train_utils_sim, "tactile_to_heatmap"),
     }
+
+
+def _required_attr(module, name):
+    if not hasattr(module, name):
+        raise ImportError(
+            f"{module.__name__} is missing {name!r}. The render script needs "
+            "the same train_utils_sim rollout helpers used by training. "
+            "Update the Euler checkout or copy the current helper implementation."
+        )
+    return getattr(module, name)
 
 
 def build_runtime_state(args, variant, rt):
