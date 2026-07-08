@@ -7,7 +7,7 @@ def bootstrap_sim_paths():
     repo_root = Path(__file__).resolve().parents[1]
     paths = [
         repo_root / "tactile_envs" / "tactile_envs" / "envs" / "robosuite",
-        repo_root / "libero",
+        repo_root / "LIBERO",
     ]
     for path in reversed(paths):
         path_str = str(path)

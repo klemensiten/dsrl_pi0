@@ -13,7 +13,7 @@ from jaxrl2.utils.launch_util import (
 
 
 ENTITY = 'kiten'
-PROJECT_NAME = 'DSRL_pi0_Libero_May_22_17_30_Test_Touch_R2'
+PROJECT_NAME = 'DSRL_pi0_Libero_July_8_23_30_Test_Piper'
 MODULE_NAME = 'examples.launch_train_sim'
 
 
@@ -22,10 +22,19 @@ def _int_list_from_env(name, default):
     return [int(v) for v in value.replace(',', ' ').split()]
 
 
+# Change to 'Piper' to launch Piper LIBERO experiments.
+LIBERO_ROBOT = 'Piper'
+TOUCH_GRIPPER_TYPE = (
+    'PiperGripper' if LIBERO_ROBOT == 'Piper' else 'PandaGripper'
+)
+
+
 # base experiment.
 BASE_FLAGS = {
     'algorithm': 'pixel_maxinfosac',
     'env': 'libero',
+    'libero_robot': LIBERO_ROBOT,
+    'dsrl_action_mode': 'noise',
     'prefix': 'dsrl_pi0_libero_maxinfo',
     'wandb_project': PROJECT_NAME,
     'batch_size': 256,
@@ -65,8 +74,8 @@ BASE_FLAGS = {
 SWEEP_FLAGS = {
     'seed': [0, 1, 2],
     'touch_gripper_type': [
-        'Robotiq85TactileGripper',
-        'PandaGripper',
+        # 'Robotiq85TactileGripper',
+        TOUCH_GRIPPER_TYPE,
     ],
     'dyn_ent_lr': [0.0003],
     'init_dyn_ent_temperature': [1.0],
@@ -76,6 +85,7 @@ SWEEP_FLAGS = {
     # 'num_model_heads': [7, 5, 1],
     # 'predict_reward': [1, 0],
     # 'backup_entropy': [1, 0],
+    'add_tactile': [0, 1],
     'ensemble_disagreement_modalities': [
         'state', 'latent', 'image', 'tactile', 'latent,state',
         'latent,image', 'latent,tactile', 'state,image',
@@ -105,6 +115,7 @@ SWEEP_FLAGS = {
 GRIPPER_STATE_INDICES = {
     'Robotiq85TactileGripper': [0, 3],
     'PandaGripper': [0, 1],
+    'PiperGripper': [0, 1],
 }
 
 

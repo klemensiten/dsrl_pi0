@@ -130,3 +130,12 @@ wandb_config.py
 logs/
 wandb/
 libero/
+jaxrl2/agents/maxinfodrqv2
+jaxrl2/agents/tactile_agents
+checkpoints/
+*.svg
+*.png
+*.pdf
+*.tex       
+*.pkl   
+*.csv 

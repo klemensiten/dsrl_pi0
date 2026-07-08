@@ -38,6 +38,9 @@ if __name__ == '__main__':
     parser.add_argument('--query_freq', default=-1, help='query frequency', type=int)
     parser.add_argument('--libero_suite', default='libero_90', help='LIBERO benchmark suite to use when --env libero.')
     parser.add_argument('--libero_task_id', default=57, help='LIBERO task id within the selected benchmark suite.', type=int)
+    parser.add_argument('--libero_robot', default='Panda', help='LIBERO robot name before scene prefixing, e.g. Panda or Piper.')
+    parser.add_argument('--dsrl_action_mode', default='noise', choices=('noise', 'delta', 'both'), help='interpret learned DSRL action as diffusion noise, residual delta, or both')
+    parser.add_argument('--residual_delta_fraction', default=0.1, help='fraction of finite env action range used as the residual delta bound', type=float)
     
     train_args_dict = dict(
         actor_lr=1e-4,

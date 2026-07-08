@@ -7,6 +7,14 @@ import math
 import PIL
 from PIL import Image
 
+DSRL_ACTION_MODES = ('noise', 'delta', 'both')
+DEFAULT_PI0_ACTION_HORIZON = 50
+DEFAULT_PI0_NOISE_DIM = 32
+DEFAULT_RESIDUAL_DELTA_FRACTION = 0.1
+DEFAULT_TACTILE_SHAPE = (32, 64, 3)
+TACTILE_SHAPE_BY_GRIPPER = {
+}
+
 def _quat2axisangle(quat):
     """
     Copied from robosuite: https://github.com/ARISE-Initiative/robosuite/blob/eafb81f54ffc104f905ee48a16bb15f059176ad3/robosuite/utils/transform_utils.py#L490C1-L512C55
@@ -131,12 +139,17 @@ def obs_to_gripper_qpos(obs, variant):
     return np.pad(qpos, (0, target_dim - qpos.size))
 
 def get_tactile_shape(variant):
-    tactile_shape = getattr(variant, 'tactile_shape', (32, 64, 3))
+    tactile_shape = getattr(variant, 'tactile_shape', DEFAULT_TACTILE_SHAPE)
     if isinstance(tactile_shape, str):
         tactile_shape = tuple(
             int(dim) for dim in tactile_shape.replace(',', ' ').split())
     else:
         tactile_shape = tuple(int(dim) for dim in tactile_shape)
+    touch_gripper_type = getattr(variant, 'touch_gripper_type', None)
+    if (
+            tactile_shape == DEFAULT_TACTILE_SHAPE
+            and touch_gripper_type in TACTILE_SHAPE_BY_GRIPPER):
+        tactile_shape = TACTILE_SHAPE_BY_GRIPPER[touch_gripper_type]
     if len(tactile_shape) != 3:
         raise ValueError(
             f'tactile_shape must be three image-style dims (H, W, C); '
@@ -217,6 +230,265 @@ def obs_to_agent_input(obs, variant, curr_image=None):
         tactile = obs_to_tactile(obs, variant)
         obs_dict['tactile'] = tactile[np.newaxis, ..., np.newaxis]
     return obs_dict
+
+def get_dsrl_action_mode(variant):
+    mode = str(getattr(variant, 'dsrl_action_mode', 'noise')).strip().lower()
+    if mode not in DSRL_ACTION_MODES:
+        raise ValueError(
+            f"Unsupported dsrl_action_mode '{mode}'. "
+            f"Expected one of {DSRL_ACTION_MODES}.")
+    return mode
+
+def get_pi0_action_horizon(agent_dp=None):
+    return int(getattr(agent_dp, 'action_horizon', DEFAULT_PI0_ACTION_HORIZON))
+
+def get_pi0_noise_dim(agent_dp=None):
+    return int(getattr(agent_dp, 'action_dim', DEFAULT_PI0_NOISE_DIM))
+
+def get_default_actual_action_dim(variant):
+    if variant.env == 'libero':
+        return 7
+    if variant.env == 'aloha_cube':
+        return 14
+    raise NotImplementedError()
+
+def get_actual_action_dim(variant):
+    action_dim = getattr(variant, 'actual_action_dim', None)
+    if action_dim is None:
+        return get_default_actual_action_dim(variant)
+    return int(action_dim)
+
+def _action_bounds_candidates(env):
+    action_space = getattr(env, 'action_space', None)
+    if action_space is not None and hasattr(action_space, 'low') and hasattr(action_space, 'high'):
+        yield action_space.low, action_space.high
+
+    inner_env = getattr(env, 'env', None)
+    if inner_env is not None and hasattr(inner_env, 'action_spec'):
+        try:
+            yield inner_env.action_spec
+        except Exception:
+            pass
+
+    if hasattr(env, 'action_spec'):
+        try:
+            yield env.action_spec
+        except Exception:
+            pass
+
+def infer_actual_action_dim(variant, env=None):
+    default_dim = get_default_actual_action_dim(variant)
+    if env is None:
+        return default_dim
+
+    for low, high in _action_bounds_candidates(env):
+        low = np.asarray(low).reshape(-1)
+        high = np.asarray(high).reshape(-1)
+        if low.size == high.size == default_dim:
+            return default_dim
+    return default_dim
+
+def get_env_action_bounds(env, actual_action_dim):
+    for low, high in _action_bounds_candidates(env):
+        low = np.asarray(low, dtype=np.float32).reshape(-1)
+        high = np.asarray(high, dtype=np.float32).reshape(-1)
+        if low.size == high.size == actual_action_dim:
+            return low, high
+
+    low = np.full((actual_action_dim,), np.nan, dtype=np.float32)
+    high = np.full((actual_action_dim,), np.nan, dtype=np.float32)
+    return low, high
+
+def action_bounds_to_config_list(bounds):
+    bounds = np.asarray(bounds, dtype=np.float32).reshape(-1)
+    return [
+        float(bound) if np.isfinite(bound) else None
+        for bound in bounds
+    ]
+
+def compute_residual_delta_bounds(action_low, action_high, residual_delta_fraction):
+    action_low = np.asarray(action_low, dtype=np.float32)
+    action_high = np.asarray(action_high, dtype=np.float32)
+    residual_delta_fraction = float(residual_delta_fraction)
+    fallback = np.full_like(action_low, residual_delta_fraction, dtype=np.float32)
+    finite = np.isfinite(action_low) & np.isfinite(action_high)
+    positive_range = action_high > action_low
+    scaled = residual_delta_fraction * (action_high - action_low)
+    return np.where(finite & positive_range, scaled, fallback).astype(np.float32)
+
+def get_residual_delta_bounds(variant, actual_action_dim=None):
+    residual_delta_bounds = getattr(variant, 'residual_delta_bounds', None)
+    if residual_delta_bounds is not None:
+        return np.asarray(residual_delta_bounds, dtype=np.float32)
+
+    if actual_action_dim is None:
+        actual_action_dim = get_actual_action_dim(variant)
+    fallback = float(getattr(
+        variant,
+        'residual_delta_fraction',
+        DEFAULT_RESIDUAL_DELTA_FRACTION,
+    ))
+    return np.full((actual_action_dim,), fallback, dtype=np.float32)
+
+def get_dsrl_action_width(variant, pi0_noise_dim=DEFAULT_PI0_NOISE_DIM,
+                          actual_action_dim=None):
+    mode = get_dsrl_action_mode(variant)
+    if actual_action_dim is None:
+        actual_action_dim = get_actual_action_dim(variant)
+    if mode == 'noise':
+        return int(pi0_noise_dim)
+    if mode == 'delta':
+        return int(actual_action_dim)
+    if mode == 'both':
+        return int(pi0_noise_dim) + int(actual_action_dim)
+    raise AssertionError(f'Unhandled DSRL action mode: {mode}')
+
+def get_dsrl_action_shape(variant, pi0_noise_dim=DEFAULT_PI0_NOISE_DIM,
+                          actual_action_dim=None):
+    return (1, get_dsrl_action_width(
+        variant,
+        pi0_noise_dim=pi0_noise_dim,
+        actual_action_dim=actual_action_dim,
+    ))
+
+def split_dsrl_action(variant, learner_action, pi0_noise_dim=DEFAULT_PI0_NOISE_DIM,
+                      actual_action_dim=None):
+    mode = get_dsrl_action_mode(variant)
+    if actual_action_dim is None:
+        actual_action_dim = get_actual_action_dim(variant)
+
+    expected_width = get_dsrl_action_width(
+        variant,
+        pi0_noise_dim=pi0_noise_dim,
+        actual_action_dim=actual_action_dim,
+    )
+    learner_action = np.asarray(learner_action, dtype=np.float32).reshape(1, expected_width)
+
+    if mode == 'noise':
+        return learner_action, None
+    if mode == 'delta':
+        return None, learner_action
+    if mode == 'both':
+        return (
+            learner_action[:, :pi0_noise_dim],
+            learner_action[:, pi0_noise_dim:],
+        )
+    raise AssertionError(f'Unhandled DSRL action mode: {mode}')
+
+def _compose_dsrl_action(variant, noise_chunk, delta_normalized,
+                         pi0_noise_dim, actual_action_dim):
+    mode = get_dsrl_action_mode(variant)
+    if mode == 'noise':
+        return np.asarray(noise_chunk, dtype=np.float32).reshape(1, pi0_noise_dim)
+    if mode == 'delta':
+        return np.asarray(delta_normalized, dtype=np.float32).reshape(1, actual_action_dim)
+    if mode == 'both':
+        noise_chunk = np.asarray(noise_chunk, dtype=np.float32).reshape(1, pi0_noise_dim)
+        delta_normalized = np.asarray(delta_normalized, dtype=np.float32).reshape(1, actual_action_dim)
+        return np.concatenate([noise_chunk, delta_normalized], axis=-1)
+    raise AssertionError(f'Unhandled DSRL action mode: {mode}')
+
+def _noise_chunk_to_horizon(noise_chunk, action_horizon):
+    noise_chunk = jax.numpy.asarray(noise_chunk)
+    if noise_chunk.shape[0] >= action_horizon:
+        return noise_chunk[:action_horizon][None]
+
+    repeat = jax.numpy.repeat(
+        noise_chunk[-1:, :],
+        action_horizon - noise_chunk.shape[0],
+        axis=0,
+    )
+    return jax.numpy.concatenate([noise_chunk, repeat], axis=0)[None]
+
+def make_dsrl_components(variant, learner_action, key, action_chunk_shape,
+                         action_horizon, pi0_noise_dim, actual_action_dim,
+                         random_delta=False, zero_delta=False,
+                         full_horizon_noise=False):
+    mode = get_dsrl_action_mode(variant)
+    noise_key, delta_key = jax.random.split(key)
+    noise_chunk = None
+    full_noise = None
+    delta_normalized = None
+
+    if learner_action is None:
+        if mode in ('noise', 'both'):
+            if full_horizon_noise:
+                full_noise = jax.random.normal(
+                    noise_key,
+                    (1, action_horizon, pi0_noise_dim),
+                )
+                noise_chunk = full_noise[0, :action_chunk_shape[0], :]
+            else:
+                noise_chunk = jax.random.normal(noise_key, (action_chunk_shape[0], pi0_noise_dim))
+        if mode in ('delta', 'both'):
+            if zero_delta:
+                delta_normalized = np.zeros((action_chunk_shape[0], actual_action_dim), dtype=np.float32)
+            elif random_delta:
+                delta_normalized = jax.random.uniform(
+                    delta_key,
+                    (action_chunk_shape[0], actual_action_dim),
+                    minval=-1.0,
+                    maxval=1.0,
+                )
+            else:
+                delta_normalized = np.zeros((action_chunk_shape[0], actual_action_dim), dtype=np.float32)
+        learner_action = _compose_dsrl_action(
+            variant,
+            noise_chunk,
+            delta_normalized,
+            pi0_noise_dim,
+            actual_action_dim,
+        )
+    else:
+        learner_action = np.reshape(learner_action, action_chunk_shape)
+        noise_chunk, delta_normalized = split_dsrl_action(
+            variant,
+            learner_action,
+            pi0_noise_dim=pi0_noise_dim,
+            actual_action_dim=actual_action_dim,
+        )
+
+    if full_noise is not None:
+        noise = full_noise
+    elif noise_chunk is None:
+        noise = jax.random.normal(noise_key, (1, action_horizon, pi0_noise_dim))
+    else:
+        noise = _noise_chunk_to_horizon(noise_chunk, action_horizon)
+
+    return np.asarray(learner_action, dtype=np.float32), noise, delta_normalized
+
+def apply_residual_delta(variant, actions, delta_normalized):
+    actions = np.asarray(actions, dtype=np.float32)
+    action_dim = actions.shape[-1]
+
+    if delta_normalized is not None:
+        delta_normalized = np.asarray(delta_normalized, dtype=np.float32)
+        delta_normalized = np.clip(delta_normalized, -1.0, 1.0)
+        residual_delta_bounds = get_residual_delta_bounds(
+            variant,
+            actual_action_dim=action_dim,
+        )
+        delta = delta_normalized * residual_delta_bounds
+        actions = actions + delta
+
+    action_low = getattr(variant, 'actual_action_low', None)
+    action_high = getattr(variant, 'actual_action_high', None)
+    if action_low is None or action_high is None:
+        return actions
+
+    action_low = np.asarray(action_low, dtype=np.float32)
+    action_high = np.asarray(action_high, dtype=np.float32)
+    finite = np.isfinite(action_low) & np.isfinite(action_high)
+    if not np.any(finite):
+        return actions
+
+    clipped_actions = np.array(actions, copy=True)
+    clipped_actions[..., finite] = np.clip(
+        clipped_actions[..., finite],
+        action_low[finite],
+        action_high[finite],
+    )
+    return clipped_actions
 
 def trajwise_alternating_training_loop(variant, agent, env, eval_env, online_replay_buffer, replay_buffer, wandb_logger,
                                        perform_control_evals=True, shard_fn=None, agent_dp=None):
@@ -324,6 +596,9 @@ def collect_traj(variant, agent, env, i, agent_dp=None):
     query_frequency = variant.query_freq
     max_timesteps = variant.max_timesteps
     env_max_reward = variant.env_max_reward
+    action_horizon = get_pi0_action_horizon(agent_dp)
+    pi0_noise_dim = get_pi0_noise_dim(agent_dp)
+    actual_action_dim = get_actual_action_dim(variant)
 
     agent._rng, rng = jax.random.split(agent._rng)
     
@@ -348,20 +623,35 @@ def collect_traj(variant, agent, env, i, agent_dp=None):
             rng, key = jax.random.split(rng)
             obs_pi_zero = obs_to_pi_zero_input(obs, variant)
             if i == 0:
-                # for initial round of data collection, we sample from standard gaussian noise
-                noise = jax.random.normal(key, (1, *agent.action_chunk_shape))
-                noise_repeat = jax.numpy.repeat(noise[:, -1:, :], 50 - noise.shape[1], axis=1)
-                noise = jax.numpy.concatenate([noise, noise_repeat], axis=1)
-                actions_noise = noise[0, :agent.action_chunk_shape[0], :]
+                # For initial collection, explore with random pi0 noise and
+                # random residuals when residual modes are enabled.
+                learner_action, noise, delta_normalized = make_dsrl_components(
+                    variant,
+                    None,
+                    key,
+                    agent.action_chunk_shape,
+                    action_horizon,
+                    pi0_noise_dim,
+                    actual_action_dim,
+                    random_delta=True,
+                )
             else:
-                # sac agent predicts the noise for diffusion model
-                actions_noise = agent.sample_actions(obs_dict)
-                actions_noise = np.reshape(actions_noise, agent.action_chunk_shape)
-                noise = np.repeat(actions_noise[-1:, :], 50 - actions_noise.shape[0], axis=0)
-                noise = jax.numpy.concatenate([actions_noise, noise], axis=0)[None]
+                # SAC predicts the configured DSRL action: noise, residual,
+                # or the concatenation of both.
+                learner_action = agent.sample_actions(obs_dict)
+                learner_action, noise, delta_normalized = make_dsrl_components(
+                    variant,
+                    learner_action,
+                    key,
+                    agent.action_chunk_shape,
+                    action_horizon,
+                    pi0_noise_dim,
+                    actual_action_dim,
+                )
             
             actions = agent_dp.infer(obs_pi_zero, noise=noise)["actions"]
-            action_list.append(actions_noise)
+            actions = apply_residual_delta(variant, actions, delta_normalized)
+            action_list.append(learner_action)
             obs_list.append(obs_dict)
      
         action_t = actions[t % query_frequency]
@@ -417,6 +707,9 @@ def perform_control_eval(agent, env, i, variant, wandb_logger, agent_dp=None):
     print('query frequency', query_frequency)
     max_timesteps = variant.max_timesteps
     env_max_reward = variant.env_max_reward
+    action_horizon = get_pi0_action_horizon(agent_dp)
+    pi0_noise_dim = get_pi0_noise_dim(agent_dp)
+    actual_action_dim = get_actual_action_dim(variant)
     episode_returns = []
     highest_rewards = []
     success_rates = []
@@ -451,18 +744,36 @@ def perform_control_eval(agent, env, i, variant, wandb_logger, agent_dp=None):
                 
                 
                 if i == 0:
-                    # for initial evaluation, we sample from standard gaussian noise to evaluate the base policy's performance
-                    noise = jax.random.normal(rng, (1, 50, 32))
+                    # Initial evaluation keeps residuals at zero so it
+                    # evaluates the base pi0 policy cleanly.
+                    _, noise, delta_normalized = make_dsrl_components(
+                        variant,
+                        None,
+                        key,
+                        agent.action_chunk_shape,
+                        action_horizon,
+                        pi0_noise_dim,
+                        actual_action_dim,
+                        zero_delta=True,
+                        full_horizon_noise=True,
+                    )
                 else:
                     if hasattr(agent, 'collecting_exploration'):
-                        actions_noise = agent.eval_actions(obs_dict)
+                        learner_action = agent.eval_actions(obs_dict)
                     else:
-                        actions_noise = agent.sample_actions(obs_dict)
-                    actions_noise = np.reshape(actions_noise, agent.action_chunk_shape)
-                    noise = np.repeat(actions_noise[-1:, :], 50 - actions_noise.shape[0], axis=0)
-                    noise = jax.numpy.concatenate([actions_noise, noise], axis=0)[None]
+                        learner_action = agent.sample_actions(obs_dict)
+                    _, noise, delta_normalized = make_dsrl_components(
+                        variant,
+                        learner_action,
+                        key,
+                        agent.action_chunk_shape,
+                        action_horizon,
+                        pi0_noise_dim,
+                        actual_action_dim,
+                    )
                     
                 actions = agent_dp.infer(obs_pi_zero, noise=noise)["actions"]
+                actions = apply_residual_delta(variant, actions, delta_normalized)
               
             action_t = actions[t % query_frequency]
             
