@@ -39,8 +39,7 @@ GENERAL_DEFAULTS = {
     "query_freq": -1,
     "libero_suite": "libero_90",
     "libero_task_id": 57,
-    "dsrl_action_mode": "noise",
-    "residual_delta_fraction": 0.1,
+    "libero_robot": "Panda",
 }
 
 
@@ -90,7 +89,7 @@ TRAIN_KWARGS_DEFAULTS = {
 }
 
 
-PRESET_CHOICES = ("sac", "ablate")
+PRESET_CHOICES = ("sac", "ablate", "explorer")
 FALLBACK_PI0_ACTION_HORIZON = 50
 FALLBACK_PI0_NOISE_DIM = 32
 RUN_DIR_RE = re.compile(
@@ -113,10 +112,54 @@ def parse_args():
     parser.add_argument("--video_height", type=int, default=480)
     parser.add_argument("--side_panel_width", type=int, default=None)
     parser.add_argument("--episode_steps", type=int, default=400)
+    parser.add_argument(
+        "--init_state_id",
+        type=int,
+        default=0,
+        help="LIBERO fixed init-state index used when --use_libero_init_state is set.",
+    )
+    parser.add_argument(
+        "--settle_steps",
+        type=int,
+        default=5,
+        help="Zero-action settling steps after applying a fixed LIBERO init state.",
+    )
+    parser.add_argument(
+        "--use_libero_init_state",
+        action="store_true",
+        help=(
+            "Opt into LIBERO fixed init states. By default the renderer matches "
+            "training eval and uses raw env.reset()."
+        ),
+    )
     parser.add_argument("--camera", default="agentview")
     parser.add_argument("--include_wrist", action="store_true")
     parser.add_argument("--no_tactile_panel", action="store_true")
-    parser.add_argument("--stochastic_dsrl", action="store_true")
+    parser.add_argument(
+        "--deterministic_dsrl",
+        action="store_true",
+        help=(
+            "Override training eval action selection and force agent.eval_actions(). "
+            "Training eval samples SAC actions unless the agent has collecting_exploration."
+        ),
+    )
+    parser.add_argument(
+        "--collection_dsrl",
+        action="store_true",
+        help=(
+            "Render collection behavior with agent.sample_actions(). For explorer "
+            "checkpoints this uses the exploration actor while step <= explore_until."
+        ),
+    )
+    parser.add_argument(
+        "--policy_seed",
+        type=int,
+        default=None,
+        help=(
+            "Render-only override for the DSRL sampling RNG. Use different "
+            "values to sample different stochastic actions from one checkpoint."
+        ),
+    )
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument(
         "--mujoco_gl",
@@ -219,9 +262,12 @@ def resolve_checkpoint_dir(args):
     if not path.exists() or not path.is_dir():
         return
 
+    # Legacy Flax checkpoints are files, while Orbax checkpoints are
+    # directories. Support both layouts.
     candidates = [
         child for child in path.iterdir()
-        if child.is_dir() and child.name.startswith("checkpoint")
+        if child.name.startswith("checkpoint")
+        and (child.is_file() or child.is_dir())
     ]
     if not candidates:
         return
@@ -243,6 +289,8 @@ def _preset_from_prefix(prefix):
         return "sac"
     if prefix == "dsrl_pi0_libero_maxinfo":
         return "ablate"
+    if prefix == "dsrl_pi0_libero_maxinfo_explorer":
+        return "explorer"
     return None
 
 
@@ -251,6 +299,8 @@ def _load_preset_flags(args):
         from examples.scripts import launcher_sac as launcher
     elif args.launcher_preset == "ablate":
         from examples.scripts import launcher_ablate as launcher
+    elif args.launcher_preset == "explorer":
+        from examples.scripts import launcher_explorer as launcher
     else:
         raise ValueError(f"Unknown launcher preset: {args.launcher_preset}")
 
@@ -322,6 +372,7 @@ def build_variant(args):
     data.update(copy.deepcopy(GENERAL_DEFAULTS))
     data.update(copy.deepcopy(TRAIN_KWARGS_DEFAULTS))
     data.update(copy.deepcopy(flags))
+    data["dsrl_action_mode"] = "noise"
 
     train_kwargs = {
         key: copy.deepcopy(data[key])
@@ -370,6 +421,16 @@ def validate_render_args(args):
         raise ValueError("--side_panel_width must be positive when set.")
     if args.episode_steps <= 0:
         raise ValueError("--episode_steps must be positive.")
+    if args.init_state_id < 0:
+        raise ValueError("--init_state_id must be non-negative.")
+    if args.settle_steps < 0:
+        raise ValueError("--settle_steps must be non-negative.")
+    if args.policy_seed is not None and args.policy_seed < 0:
+        raise ValueError("--policy_seed must be non-negative when set.")
+    if args.collection_dsrl and args.deterministic_dsrl:
+        raise ValueError(
+            "--collection_dsrl and --deterministic_dsrl cannot both be set."
+        )
 
 
 def import_runtime():
@@ -386,7 +447,12 @@ def import_runtime():
     from openpi.shared import download
     from openpi.training import config as openpi_config
 
-    from examples.train_sim import DummyEnv, _get_libero_env, _make_agent
+    from examples.train_sim import (
+        DummyEnv,
+        _get_libero_env,
+        _make_agent,
+        _resolve_touch_gripper_type,
+    )
     from examples import train_utils_sim
 
     DEFAULT_PI0_ACTION_HORIZON = getattr(
@@ -416,20 +482,9 @@ def import_runtime():
         "DummyEnv": DummyEnv,
         "_get_libero_env": _get_libero_env,
         "_make_agent": _make_agent,
+        "_resolve_touch_gripper_type": _resolve_touch_gripper_type,
         "DEFAULT_PI0_ACTION_HORIZON": DEFAULT_PI0_ACTION_HORIZON,
         "DEFAULT_PI0_NOISE_DIM": DEFAULT_PI0_NOISE_DIM,
-        "action_bounds_to_config_list": _required_attr(
-            train_utils_sim, "action_bounds_to_config_list"),
-        "apply_residual_delta": _required_attr(
-            train_utils_sim, "apply_residual_delta"),
-        "compute_residual_delta_bounds": _required_attr(
-            train_utils_sim, "compute_residual_delta_bounds"),
-        "get_actual_action_dim": _required_attr(
-            train_utils_sim, "get_actual_action_dim"),
-        "get_dsrl_action_mode": _required_attr(
-            train_utils_sim, "get_dsrl_action_mode"),
-        "get_env_action_bounds": _required_attr(
-            train_utils_sim, "get_env_action_bounds"),
         "get_pi0_action_horizon": getattr(
             train_utils_sim, "get_pi0_action_horizon",
             lambda agent_dp=None: int(getattr(
@@ -438,10 +493,6 @@ def import_runtime():
             train_utils_sim, "get_pi0_noise_dim",
             lambda agent_dp=None: int(getattr(
                 agent_dp, "action_dim", DEFAULT_PI0_NOISE_DIM))),
-        "infer_actual_action_dim": _required_attr(
-            train_utils_sim, "infer_actual_action_dim"),
-        "make_dsrl_components": _required_attr(
-            train_utils_sim, "make_dsrl_components"),
         "obs_to_agent_input": _required_attr(train_utils_sim, "obs_to_agent_input"),
         "obs_to_img": _required_attr(train_utils_sim, "obs_to_img"),
         "obs_to_pi_zero_input": _required_attr(
@@ -470,33 +521,29 @@ def build_runtime_state(args, variant, rt):
         )
     task_suite = benchmark_dict[variant.libero_suite]()
     task = task_suite.get_task(variant.libero_task_id)
+    init_states = None
+    if args.use_libero_init_state:
+        init_states = task_suite.get_task_init_states(variant.libero_task_id)
+    libero_robot = getattr(variant, "libero_robot", "Panda")
+    touch_gripper_type = rt["_resolve_touch_gripper_type"](
+        libero_robot,
+        getattr(variant, "touch_gripper_type", "Robotiq85TactileGripper"),
+    )
+    variant.libero_robot = libero_robot
+    variant.touch_gripper_type = touch_gripper_type
     env, task_description = rt["_get_libero_env"](
         task,
         args.render_resolution,
         variant.seed,
+        libero_robot=libero_robot,
         use_touch=bool(getattr(variant, "use_touch", 0)),
-        touch_gripper_type=getattr(
-            variant, "touch_gripper_type", "Robotiq85TactileGripper"
-        ),
+        touch_gripper_type=touch_gripper_type,
     )
 
     variant.task_description = task_description
     variant.env_max_reward = 1
     variant.max_timesteps = int(args.episode_steps)
-    variant.dsrl_action_mode = rt["get_dsrl_action_mode"](variant)
-    variant.actual_action_dim = rt["infer_actual_action_dim"](variant, env)
-
-    action_low, action_high = rt["get_env_action_bounds"](
-        env, variant.actual_action_dim
-    )
-    residual_delta_fraction = float(getattr(variant, "residual_delta_fraction", 0.1))
-    variant.actual_action_low = rt["action_bounds_to_config_list"](action_low)
-    variant.actual_action_high = rt["action_bounds_to_config_list"](action_high)
-    variant.residual_delta_bounds = rt["compute_residual_delta_bounds"](
-        action_low,
-        action_high,
-        residual_delta_fraction,
-    ).tolist()
+    variant.dsrl_action_mode = "noise"
 
     config = rt["openpi_config"].get_config("pi0_libero")
     pi0_checkpoint_dir = rt["download"].maybe_download(args.pi0_checkpoint)
@@ -513,7 +560,16 @@ def build_runtime_state(args, variant, rt):
     sample_action = rt["add_batch_dim"](dummy_env.action_space.sample())
     agent = rt["_make_agent"](variant, sample_obs, sample_action)
 
-    return env, task_description, dummy_env, sample_obs, sample_action, agent, agent_dp
+    return (
+        env,
+        task_description,
+        init_states,
+        dummy_env,
+        sample_obs,
+        sample_action,
+        agent,
+        agent_dp,
+    )
 
 
 def restore_agent(args, agent):
@@ -522,16 +578,20 @@ def restore_agent(args, agent):
     agent.restore_checkpoint(str(args.checkpoint_dir))
 
 
-def render_rollout(args, variant, env, agent, agent_dp, rt, rollout_id):
-    jax = rt["jax"]
+def apply_policy_seed(args, agent, rt):
+    if args.policy_seed is None:
+        return
+    agent._rng = rt["jax"].random.PRNGKey(int(args.policy_seed))
+
+
+def render_rollout(args, variant, env, init_states, agent, agent_dp, rt, rollout_id):
     query_frequency = int(variant.query_freq)
     max_timesteps = int(variant.max_timesteps)
     action_horizon = rt["get_pi0_action_horizon"](agent_dp)
     pi0_noise_dim = rt["get_pi0_noise_dim"](agent_dp)
-    actual_action_dim = rt["get_actual_action_dim"](variant)
-    rng = jax.random.PRNGKey(int(variant.seed) + 456 + rollout_id)
 
-    obs = env.reset()
+    obs, init_state_index = reset_rollout_env(
+        args, env, init_states, variant, rollout_id)
     records = []
     rewards = []
     actions = None
@@ -543,24 +603,15 @@ def render_rollout(args, variant, env, agent, agent_dp, rt, rollout_id):
         if t % query_frequency == 0:
             obs_dict = rt["obs_to_agent_input"](obs, variant, curr_image=curr_image)
             obs_pi_zero = rt["obs_to_pi_zero_input"](obs, variant)
-            rng, key = jax.random.split(rng)
 
-            if args.stochastic_dsrl:
-                learner_action = agent.sample_actions(obs_dict)
-            else:
-                learner_action = agent.eval_actions(obs_dict)
-
-            _, noise, delta_normalized = rt["make_dsrl_components"](
-                variant,
+            learner_action = select_eval_learner_action(args, agent, obs_dict)
+            noise = learner_action_to_noise(
                 learner_action,
-                key,
                 agent.action_chunk_shape,
                 action_horizon,
                 pi0_noise_dim,
-                actual_action_dim,
             )
             actions = agent_dp.infer(obs_pi_zero, noise=noise)["actions"]
-            actions = rt["apply_residual_delta"](variant, actions, delta_normalized)
 
         action_t = actions[t % query_frequency]
         obs, reward, done, _ = env.step(action_t)
@@ -580,7 +631,82 @@ def render_rollout(args, variant, env, agent, agent_dp, rt, rollout_id):
         "episode_return": episode_return,
         "highest_reward": highest_reward,
         "success": success,
+        "init_state_index": init_state_index,
     }
+
+
+def select_eval_learner_action(args, agent, obs_dict):
+    if args.collection_dsrl:
+        return agent.sample_actions(obs_dict)
+
+    if args.deterministic_dsrl:
+        return agent.eval_actions(obs_dict)
+
+    if hasattr(agent, "collecting_exploration"):
+        return agent.eval_actions(obs_dict)
+
+    return agent.sample_actions(obs_dict)
+
+
+def reset_rollout_env(args, env, init_states, variant, rollout_id):
+    obs = env.reset()
+    if not args.use_libero_init_state:
+        return obs, None
+
+    if init_states is None or len(init_states) == 0:
+        raise ValueError("No LIBERO init states are available for this task.")
+
+    init_state_index = (args.init_state_id + rollout_id) % len(init_states)
+    obs = env.set_init_state(init_states[init_state_index])
+
+    zero_action = zero_env_action(env)
+    for _ in range(args.settle_steps):
+        obs, _, done, _ = env.step(zero_action)
+        if done:
+            break
+    return obs, init_state_index
+
+
+def zero_env_action(env):
+    action_dim = getattr(getattr(env, "env", None), "action_dim", None)
+    if action_dim is not None:
+        return np.zeros(action_dim, dtype=np.float32)
+
+    for candidate in (
+        getattr(env, "action_space", None),
+        getattr(getattr(env, "env", None), "action_space", None),
+    ):
+        if candidate is not None and hasattr(candidate, "shape"):
+            return np.zeros(candidate.shape, dtype=np.float32)
+
+    for owner in (env, getattr(env, "env", None)):
+        action_spec = getattr(owner, "action_spec", None)
+        if action_spec is not None:
+            low, _ = action_spec
+            return np.zeros_like(np.asarray(low, dtype=np.float32))
+
+    return np.zeros(7, dtype=np.float32)
+
+
+def learner_action_to_noise(learner_action, action_chunk_shape, action_horizon,
+                            pi0_noise_dim):
+    noise_chunk = np.asarray(learner_action, dtype=np.float32).reshape(
+        action_chunk_shape)
+    if noise_chunk.shape[-1] != pi0_noise_dim:
+        raise ValueError(
+            f"DSRL action width {noise_chunk.shape[-1]} does not match Pi0 "
+            f"noise dim {pi0_noise_dim}. This renderer expects noise-only "
+            "checkpoints."
+        )
+    if noise_chunk.shape[0] >= action_horizon:
+        return noise_chunk[:action_horizon][None]
+
+    repeat = np.repeat(
+        noise_chunk[-1:, :],
+        action_horizon - noise_chunk.shape[0],
+        axis=0,
+    )
+    return np.concatenate([noise_chunk, repeat], axis=0)[None]
 
 
 def capture_record(args, variant, obs, rt):
@@ -668,19 +794,28 @@ def _resize_rgb(frame, size, resampling):
     return Image.fromarray(frame).resize(size, resampling)
 
 
-def output_path_for_rollout(output_path, rollout_id, num_rollouts):
+def output_path_for_rollout(output_path, rollout_id, num_rollouts, policy_seed):
+    policy_seed_part = f"policyseed{policy_seed}"
     if output_path.suffix.lower() == ".mp4":
+        stem = output_path.stem
         if num_rollouts == 1:
-            return output_path
+            return output_path.with_name(
+                f"{stem}_{policy_seed_part}{output_path.suffix}"
+            )
         return output_path.with_name(
-            f"{output_path.stem}_rollout{rollout_id:03d}{output_path.suffix}"
+            f"{stem}_{policy_seed_part}_rollout{rollout_id:03d}{output_path.suffix}"
         )
     output_path.mkdir(parents=True, exist_ok=True)
-    return output_path / f"rollout_{rollout_id:03d}.mp4"
+    return output_path / f"{policy_seed_part}_rollout_{rollout_id:03d}.mp4"
 
 
 def write_rollout_outputs(args, variant, rollout, rt, rollout_id):
-    video_path = output_path_for_rollout(args.output_path, rollout_id, args.rollouts)
+    video_path = output_path_for_rollout(
+        args.output_path,
+        rollout_id,
+        args.rollouts,
+        effective_policy_seed(args, variant),
+    )
     video_path.parent.mkdir(parents=True, exist_ok=True)
 
     frames = compose_video_frames(args, rollout["records"], rt)
@@ -708,11 +843,34 @@ def rollout_summary(args, variant, rollout, video_path, rollout_id):
         "video_width": args.video_width,
         "video_height": args.video_height,
         "camera": args.camera,
+        "init_state_id": args.init_state_id,
+        "init_state_index": rollout["init_state_index"],
+        "libero_init_state": bool(args.use_libero_init_state),
+        "matches_training_eval_reset": not args.use_libero_init_state,
+        "settle_steps": args.settle_steps,
         "include_wrist": bool(args.include_wrist),
         "include_tactile_panel": should_render_tactile(args, variant),
-        "stochastic_dsrl": bool(args.stochastic_dsrl),
+        "dsrl_action_selection": dsrl_action_selection(args, variant),
+        "policy_seed": effective_policy_seed(args, variant),
+        "policy_seed_override": args.policy_seed,
         "variant": serializable_variant(variant),
     }
+
+
+def effective_policy_seed(args, variant):
+    if args.policy_seed is not None:
+        return int(args.policy_seed)
+    return int(variant.seed)
+
+
+def dsrl_action_selection(args, variant):
+    if args.collection_dsrl:
+        return "sample_actions_collection"
+    if args.deterministic_dsrl:
+        return "eval_actions_forced"
+    if str(getattr(variant, "algorithm", "")).strip().lower() == "pixel_maxinfosac_explorer":
+        return "eval_actions_training_eval_explorer"
+    return "sample_actions_training_eval"
 
 
 def serializable_variant(variant):
@@ -752,7 +910,7 @@ def print_dry_run_summary(variant, sample_obs, sample_action, task_description):
     print(f"  task: {variant.libero_suite}/{variant.libero_task_id}")
     print(f"  description: {task_description}")
     print(f"  add_tactile/use_touch: {variant.add_tactile}/{variant.use_touch}")
-    print(f"  dsrl_action_mode: {variant.dsrl_action_mode}")
+    print("  DSRL steering: Pi0 noise")
     print(f"  sample obs shapes: {obs_shapes}")
     print(f"  sample action shape: {list(sample_action.shape)}")
 
@@ -768,7 +926,7 @@ def main():
 
     env = None
     try:
-        env, task_description, _, sample_obs, sample_action, agent, agent_dp = (
+        env, task_description, init_states, _, sample_obs, sample_action, agent, agent_dp = (
             build_runtime_state(args, variant, rt)
         )
         if args.dry_run:
@@ -776,10 +934,11 @@ def main():
             return 0
 
         restore_agent(args, agent)
+        apply_policy_seed(args, agent, rt)
 
         for rollout_id in range(args.rollouts):
             rollout = render_rollout(
-                args, variant, env, agent, agent_dp, rt, rollout_id
+                args, variant, env, init_states, agent, agent_dp, rt, rollout_id
             )
             video_path, summary_path = write_rollout_outputs(
                 args, variant, rollout, rt, rollout_id
